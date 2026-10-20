@@ -15,8 +15,9 @@ bench = false
 default = []
 # Run in Espressif QEMU: networking over the emulated OpenCores Ethernet MAC.
 qemu = ["dep:esp-openeth"]
-# Real hardware: WiFi station, with a setup access point when unconfigured.
-wifi = ["dep:esp-radio", "esp-rtos/esp-radio"]
+# Real hardware: WiFi station, with a setup access point when unconfigured,
+# plus a BLE scanner sharing the radio (coexistence).
+wifi = ["dep:esp-radio", "esp-rtos/esp-radio", "dep:bt-hci"]
 # Test hook: never confirm the image, so the bootloader must roll it back.
 fail-selftest = []
 
@@ -27,7 +28,7 @@ esp-openeth = { workspace = true, optional = true }
 
 esp-hal = { workspace = true, features = ["esp32", "log-04", "unstable"] }
 esp-rtos = { workspace = true, features = ["embassy", "esp-alloc", "esp32", "log-04"] }
-esp-radio = { workspace = true, optional = true, features = ["esp-alloc", "esp32", "log-04", "unstable", "wifi"] }
+esp-radio = { workspace = true, optional = true, features = ["esp-alloc", "esp32", "log-04", "unstable", "wifi", "ble", "coex"] }
 esp-alloc = { workspace = true, features = ["esp32"] }
 esp-println = { workspace = true, features = ["esp32", "log-04"] }
 esp-storage = { workspace = true, features = ["esp32", "embedded-storage"] }
@@ -44,6 +45,7 @@ heapless = { workspace = true }
 static_cell = { workspace = true }
 embassy-boot = { workspace = true }
 edge-mdns = { workspace = true }
+bt-hci = { workspace = true, optional = true }
 edge-nal = { workspace = true }
 edge-nal-embassy = { workspace = true }
 critical-section = "1.2"

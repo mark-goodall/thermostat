@@ -2,6 +2,12 @@ fn main() {
     linker_be_nice();
     check_xtensa_linker_available();
     println!("cargo:rustc-link-arg=-nostartfiles");
+    if std::env::var_os("CARGO_FEATURE_WIFI").is_some() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ld");
+        println!("cargo:rustc-link-search={}", dir.display());
+        println!("cargo:rustc-link-arg=-Tbt_rom_extra.x");
+        println!("cargo:rerun-if-changed=ld/bt_rom_extra.x");
+    }
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
     println!("cargo:rerun-if-env-changed=THERMOSTAT_VERSION");

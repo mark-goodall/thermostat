@@ -100,7 +100,9 @@ mod imp {
     use embassy_time::{Duration, Instant, Timer};
     use esp_radio::wifi::ap::AccessPointConfig;
     use esp_radio::wifi::sta::StationConfig;
-    use esp_radio::wifi::{AuthenticationMethodConfig, Config, Interface, WifiController};
+    use esp_radio::wifi::{
+        AuthenticationMethodConfig, Config, Interface, PowerSaveMode, WifiController,
+    };
     use thermostat_core::dhcp::{self, DhcpServer};
 
     use super::*;
@@ -186,6 +188,11 @@ mod imp {
         );
         if let Err(e) = controller.set_config(&config) {
             log::error!("wifi config: {e:?}");
+        }
+        // Modem sleep between beacons frees the shared radio for the BLE
+        // scanner; with power saving off WiFi starves Bluetooth coexistence.
+        if let Err(e) = controller.set_power_saving(PowerSaveMode::Minimum) {
+            log::warn!("wifi power save: {e:?}");
         }
         let mut last_connected = Instant::now();
         loop {

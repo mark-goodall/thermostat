@@ -62,6 +62,40 @@ curl http://<hostname>.local/api/status
 The hostname is set on the settings page or with `xtask provision --hostname`.
 A change takes effect after a reboot.
 
+## Bluetooth (BLE scanner)
+
+The WiFi build also runs a passive BLE scan on the same radio (esp-radio
+`ble` + `coex`). It drives the controller with plain HCI through `bt-hci`, so
+no host stack is needed. `/ble` in the web UI (auto-refreshing) and
+`/api/ble` list nearby advertisers with:
+
+- RSSI, name, and maker (Bluetooth SIG company ID)
+- 16-bit service UUIDs, with names for common ones
+- packet count and when each was last seen
+
+Readings from BLE thermometers using the pvvx/ATC1441 custom firmware or
+BTHome v2 are decoded into temperature, humidity and battery. Stock Xiaomi
+MiBeacon (`FE95`) payloads are encrypted and are not decoded.
+
+Bench numbers with WiFi connected:
+
+| scan window | advertisements/s | HTTP upload |
+|---|---|---|
+| 30 ms of 100 ms | ~0.3 | — |
+| continuous (chosen) | ~3.4 | 36 KB/s (66 KB/s without BLE) |
+
+Coexistence requires WiFi modem sleep, which the firmware enables. Ping RTT
+rises to 20–120 ms; HTTP stays at about 60–120 ms.
+
+Memory cost: the BT controller reserves 64 KB of DRAM, so the main stack drops
+to about 30 KB. The heap had 62 KB used and 37 KB free after BLE start (logged
+on the console every 5 minutes). The emulator build has no Bluetooth; there
+`/ble` reports "no Bluetooth radio".
+
+esp-rom-sys 0.1.5 lacks three BT ROM symbols that the controller blob needs.
+They are provided in `firmware/app/ld/bt_rom_extra.x`, with addresses from
+ESP-IDF.
+
 ## Settings and security
 
 - WiFi: only the WPA2 PSK derived from passphrase + SSID is stored, never

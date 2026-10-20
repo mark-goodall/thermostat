@@ -6,6 +6,7 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 
 pub mod auth;
+pub mod ble;
 pub mod codec;
 pub mod dhcp;
 pub mod http;

@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "wifi")]
+mod ble;
 mod device;
 mod mdns;
 mod net;
@@ -128,6 +130,8 @@ async fn main(spawner: Spawner) -> ! {
     .await;
 
     spawner.spawn(mdns::task(stack, dev).unwrap());
+    #[cfg(feature = "wifi")]
+    spawner.spawn(ble::task(peripherals.BT, dev).unwrap());
     for _ in 0..web::TASKS {
         spawner.spawn(web::task(stack, dev).unwrap());
     }

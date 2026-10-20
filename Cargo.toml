@@ -22,6 +22,7 @@ embassy-net = "0.9"
 embassy-net-driver = "0.2"
 edge-mdns = { version = "0.8", default-features = false, features = ["io"] }
 edge-nal = "0.7"
+bt-hci = { version = "0.9", default-features = false }
 edge-nal-embassy = { version = "0.9", default-features = false, features = ["udp", "multicast", "proto-ipv4", "medium-ethernet"] }
 embassy-sync = "0.8"
 embassy-time = "0.5"

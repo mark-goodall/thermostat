@@ -6,6 +6,7 @@
 use heapless::String;
 
 use crate::auth::Sessions;
+use crate::ble::BleTable;
 use crate::settings::Settings;
 use crate::store::StoreError;
 
@@ -84,6 +85,8 @@ pub trait Platform: Ota {
     fn request_reboot(&mut self);
     /// Access the login sessions shared by all web connections.
     fn sessions<R>(&mut self, f: impl FnOnce(&mut Sessions) -> R) -> R;
+    /// The BLE scan results, or `None` when the build has no Bluetooth radio.
+    fn ble<R>(&mut self, f: impl FnOnce(Option<&BleTable>) -> R) -> R;
 }
 
 #[cfg(test)]

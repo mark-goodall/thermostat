@@ -11,6 +11,8 @@
 //! | `POST /api/update` | yes   | raw image body; `?reboot=0` to stay up    |
 //! | `POST /api/reboot` | yes   |                                           |
 //! | `GET  /api/status` | –     | JSON status                               |
+//! | `GET  /ble`        | yes   | nearby BLE advertisers (auto-refreshing)  |
+//! | `GET  /api/ble`    | yes   | the same as JSON                          |
 //!
 //! "auth" accepts a session cookie or HTTP Basic credentials (for scripts).
 //! Session cookies are `HttpOnly; SameSite=Strict`, which also stops other
@@ -29,7 +31,7 @@ use crate::settings::{Settings, Str32};
 
 /// Scratch space a connection needs (request head + response page).
 pub const BUF_LEN: usize = http::MAX_HEAD + PAGE_LEN;
-const PAGE_LEN: usize = 6 * 1024;
+const PAGE_LEN: usize = 8 * 1024;
 const MAX_FORM: usize = 1024;
 
 enum Auth {
@@ -181,6 +183,22 @@ pub async fn handle<S: Read + Write, P: Platform>(
             };
             page(sock, page_buf, "Settings", true, |w| {
                 settings_form(w, &s, Some(msg))
+            })
+            .await
+        }
+        (Method::Get, "/ble") => {
+            let now = p.now_ms();
+            let snapshot = p.ble(|t| t.map(|t| (t.sorted(), t.reports, t.scanning, t.error)));
+            page(sock, page_buf, "Bluetooth", true, |w| {
+                ble_page(w, snapshot.as_ref(), now)
+            })
+            .await
+        }
+        (Method::Get, "/api/ble") => {
+            let now = p.now_ms();
+            let snapshot = p.ble(|t| t.map(|t| (t.sorted(), t.reports, t.scanning, t.error)));
+            respond(sock, page_buf, 200, "application/json", &[], |w| {
+                ble_json(w, snapshot.as_ref(), now)
             })
             .await
         }
@@ -503,7 +521,7 @@ async fn page<S: Write>(
         )?;
         if nav {
             w.write_str(
-                "<nav><a href=/>Status</a><a href=/settings>Settings</a><a href=/update>Firmware</a>\
+                "<nav><a href=/>Status</a><a href=/settings>Settings</a><a href=/update>Firmware</a><a href=/ble>Bluetooth</a>\
 <form method=post action=/logout><button>Log out</button></form></nav>",
             )?;
         }
@@ -608,6 +626,136 @@ fn settings_form(w: &mut BufWriter<'_>, s: &Settings, n: Option<Notice>) -> core
     )
 }
 
+type BleSnapshot = (
+    heapless::Vec<crate::ble::BleDevice, { crate::ble::MAX_DEVICES }>,
+    u32,
+    bool,
+    Option<&'static str>,
+);
+
+fn sensor_text(w: &mut BufWriter<'_>, r: &crate::ble::SensorReading) -> core::fmt::Result {
+    if let Some(t) = r.temperature_cc {
+        write!(w, "{} °C ", Tenths(t as i32 / 10))?;
+    }
+    if let Some(h) = r.humidity_cp {
+        write!(w, "{} % ", Tenths(h as i32 / 10))?;
+    }
+    if let Some(b) = r.battery_pct {
+        write!(w, "🔋{b}%")?;
+    }
+    Ok(())
+}
+
+fn ble_page(w: &mut BufWriter<'_>, snap: Option<&BleSnapshot>, now: u64) -> core::fmt::Result {
+    let Some((devices, reports, scanning, error)) = snap else {
+        return w.write_str("<p>This build has no Bluetooth radio (emulator).</p>");
+    };
+    write!(
+        w,
+        "<p>{} · {} devices · {} advertisements received. Refreshes every 5 s.</p>",
+        if *scanning {
+            "Passive scan running"
+        } else {
+            "Scanner not running"
+        },
+        devices.len(),
+        reports
+    )?;
+    if let Some(e) = error {
+        write!(w, "<p class=err>{}</p>", Escape(e))?;
+    }
+    w.write_str(
+        "<div style=overflow-x:auto><table style=font-size:.85em><tr><th>Address</th><th>RSSI</th><th>Name</th>\
+<th>Maker</th><th>Services</th><th>Reading</th><th>Seen</th></tr>",
+    )?;
+    for d in devices {
+        write!(w, "<tr><td><code>{}</code>", d.addr_string())?;
+        if d.addr_kind != crate::ble::AddrKind::Public {
+            write!(w, " <small>{}</small>", d.addr_kind.as_str())?;
+        }
+        write!(
+            w,
+            "</td><td>{}</td><td>{}</td><td>",
+            d.rssi,
+            Escape(d.name.as_deref().unwrap_or(""))
+        )?;
+        if let Some(c) = d.company {
+            match crate::ble::company_name(c) {
+                Some(n) => w.write_str(n)?,
+                None => write!(w, "0x{c:04X}")?,
+            }
+        }
+        w.write_str("</td><td>")?;
+        for (i, s) in d.services.iter().enumerate() {
+            write!(w, "{}{s:04X}", if i > 0 { "<br>" } else { "" })?;
+            if let Some(n) = crate::ble::service_name(*s) {
+                write!(w, " <small>{n}</small>")?;
+            }
+        }
+        w.write_str("</td><td>")?;
+        if let Some(r) = &d.sensor {
+            sensor_text(w, r)?;
+        }
+        write!(
+            w,
+            "</td><td>{} s ago · {}×</td></tr>",
+            now.saturating_sub(d.last_seen_ms) / 1000,
+            d.packets
+        )?;
+    }
+    w.write_str("</table></div><script>setTimeout(()=>location.reload(),5000)</script>")
+}
+
+fn ble_json(w: &mut BufWriter<'_>, snap: Option<&BleSnapshot>, now: u64) -> core::fmt::Result {
+    let Some((devices, reports, scanning, _)) = snap else {
+        return w.write_str("{\"supported\":false}");
+    };
+    write!(
+        w,
+        "{{\"supported\":true,\"scanning\":{scanning},\"reports\":{reports},\"devices\":["
+    )?;
+    for (i, d) in devices.iter().enumerate() {
+        write!(
+            w,
+            "{}{{\"addr\":\"{}\",\"addr_kind\":\"{}\",\"rssi\":{},\"packets\":{},\"age_s\":{}",
+            if i > 0 { "," } else { "" },
+            d.addr_string(),
+            d.addr_kind.as_str(),
+            d.rssi,
+            d.packets,
+            now.saturating_sub(d.last_seen_ms) / 1000
+        )?;
+        if let Some(n) = &d.name {
+            // Names are printable (control characters stripped); escape JSON specials.
+            w.write_str(",\"name\":\"")?;
+            for c in n.chars() {
+                match c {
+                    '"' => w.write_str("\\\"")?,
+                    '\\' => w.write_str("\\\\")?,
+                    c => w.write_char(c)?,
+                }
+            }
+            w.write_str("\"")?;
+        }
+        if let Some(c) = d.company {
+            write!(w, ",\"company\":{c}")?;
+        }
+        if let Some(r) = &d.sensor {
+            if let Some(t) = r.temperature_cc {
+                write!(w, ",\"temperature\":{}", Tenths(t as i32 / 10))?;
+            }
+            if let Some(h) = r.humidity_cp {
+                write!(w, ",\"humidity\":{}", Tenths(h as i32 / 10))?;
+            }
+            if let Some(b) = r.battery_pct {
+                write!(w, ",\"battery\":{b}")?;
+            }
+        }
+        w.write_str("}")?;
+    }
+    w.write_str("]}")
+}
+
 fn update_page(w: &mut BufWriter<'_>, version: &str) -> core::fmt::Result {
     write!(
         w,
@@ -671,6 +819,7 @@ mod tests {
         rng: u8,
         saves: usize,
         sessions: crate::auth::Sessions,
+        ble: Option<crate::ble::BleTable>,
     }
 
     impl Ota for Fake {
@@ -722,6 +871,9 @@ mod tests {
         }
         fn sessions<R>(&mut self, f: impl FnOnce(&mut crate::auth::Sessions) -> R) -> R {
             f(&mut self.sessions)
+        }
+        fn ble<R>(&mut self, f: impl FnOnce(Option<&crate::ble::BleTable>) -> R) -> R {
+            f(self.ble.as_ref())
         }
     }
 
@@ -961,5 +1113,73 @@ mod tests {
             assert!(r.text().ends_with("</html>"), "{path} truncated");
             assert!(!r.text().contains("<<"));
         }
+    }
+
+    #[test]
+    fn ble_pages() {
+        let (mut p, cookie) = provisioned();
+        assert_eq!(get(&mut p, "/ble", "").status, 303, "login required");
+        assert_eq!(get(&mut p, "/api/ble", "").status, 401);
+        assert!(
+            get(&mut p, "/ble", &cookie)
+                .text()
+                .contains("no Bluetooth radio")
+        );
+        assert_eq!(
+            get(&mut p, "/api/ble", &cookie).text(),
+            "{\"supported\":false}"
+        );
+
+        let mut t = crate::ble::BleTable::new();
+        t.scanning = true;
+        // A pvvx thermometer advertising its reading, and a phone with an HTML-ish name.
+        let mut thermo = std::vec![2, 0x01, 0x06, 18, 0x16, 0x1A, 0x18, 1, 2, 3, 4, 5, 6];
+        thermo.extend_from_slice(&2137i16.to_le_bytes());
+        thermo.extend_from_slice(&4567u16.to_le_bytes());
+        thermo.extend_from_slice(&[0x86, 0x0B, 87, 1, 0]);
+        t.observe([6, 5, 4, 3, 2, 1], 0, -55, &thermo, 500);
+        let mut phone = std::vec![4, 0xFF, 0x4C, 0x00, 0x10];
+        phone.extend_from_slice(&[5, 0x09]);
+        phone.extend_from_slice(b"<b\"x");
+        t.observe([9, 9, 9, 9, 9, 9], 1, -80, &phone, 900);
+        p.ble = Some(t);
+
+        let html = get(&mut p, "/ble", &cookie).text();
+        assert!(html.contains("2 devices"), "{html}");
+        assert!(html.contains("01:02:03:04:05:06"));
+        assert!(html.contains("21.3 °C") && html.contains("45.6 %") && html.contains("87%"));
+        assert!(html.contains("Apple") && html.contains("&lt;b&quot;x") && !html.contains("<b\"x"));
+        assert!(html.ends_with("</html>"));
+        // Strongest signal first.
+        assert!(html.find("01:02:03:04:05:06").unwrap() < html.find("09:09:09:09:09:09").unwrap());
+
+        let json = get(&mut p, "/api/ble", &cookie).text();
+        assert!(
+            json.starts_with("{\"supported\":true,\"scanning\":true,\"reports\":2,"),
+            "{json}"
+        );
+        assert!(json.contains("\"temperature\":21.3") && json.contains("\"battery\":87"));
+        assert!(json.contains("\"name\":\"<b\\\"x\""), "{json}");
+    }
+
+    #[test]
+    fn full_ble_table_fits_page() {
+        let (mut p, cookie) = provisioned();
+        let mut t = crate::ble::BleTable::new();
+        for i in 0..crate::ble::MAX_DEVICES as u8 {
+            let mut d = std::vec![25, 0x09];
+            d.extend_from_slice(&[b'N'; 24]);
+            d.extend_from_slice(&[9, 0x03, 0x0F, 0x18, 0x1A, 0x18, 0x0A, 0x18, 0x0D, 0x18]);
+            d.extend_from_slice(&[3, 0xFF, 0x34, 0x12]);
+            t.observe([i, 0, 0, 0, 0, 0], 1, -100, &d, 0);
+        }
+        p.ble = Some(t);
+        let html = get(&mut p, "/ble", &cookie).text();
+        assert!(
+            html.ends_with("</html>"),
+            "page truncated at {} bytes",
+            html.len()
+        );
+        assert!(get(&mut p, "/api/ble", &cookie).text().ends_with("]}"));
     }
 }

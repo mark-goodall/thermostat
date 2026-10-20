@@ -11,6 +11,7 @@ use esp_hal::rng::Rng;
 use esp_storage::FlashStorage;
 use heapless::String;
 use thermostat_core::auth::Sessions;
+use thermostat_core::ble::BleTable;
 use thermostat_core::platform::{BootState, DeviceStatus, Ota, OtaError, Platform};
 use thermostat_core::settings::Settings;
 use thermostat_core::store::{SettingsStore, StoreError};
@@ -38,6 +39,8 @@ pub struct Device {
     pub updater: FirmwareUpdater,
     pub rng: Rng,
     pub sessions: Sessions,
+    /// Nearby BLE advertisers (filled by the scanner in WiFi builds).
+    pub ble: BleTable,
     pub boot: BootState,
     pub network: String<48>,
     pub reboot_requested: bool,
@@ -64,6 +67,7 @@ impl Device {
             updater,
             rng: Rng::new(),
             sessions: Sessions::new(),
+            ble: BleTable::new(),
             boot,
             network: String::try_from("starting").unwrap(),
             reboot_requested: false,
@@ -201,5 +205,10 @@ impl Platform for Handle {
 
     fn sessions<R>(&mut self, f: impl FnOnce(&mut Sessions) -> R) -> R {
         self.with(|d| f(&mut d.sessions))
+    }
+
+    fn ble<R>(&mut self, f: impl FnOnce(Option<&BleTable>) -> R) -> R {
+        // The emulator has no Bluetooth radio.
+        self.with(|d| f(cfg!(feature = "wifi").then_some(&d.ble)))
     }
 }
