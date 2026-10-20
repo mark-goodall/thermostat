@@ -1,0 +1,27 @@
+[package]
+name = "embassy-boot-esp"
+description = "embassy-boot support for Espressif chips: a Rust second-stage bootloader and app-side firmware updater"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Host-side helpers (image builder) used by tooling.
+std = ["sha2/std"]
+# Second-stage bootloader runtime (ESP32 ROM flash + MMU). Only builds for xtensa-esp32-none-elf.
+bootloader = ["dep:esp-rom-sys"]
+log = ["dep:log"]
+
+[dependencies]
+embassy-boot = { workspace = true }
+embedded-storage = { workspace = true }
+embassy-embedded-hal = { workspace = true }
+embassy-sync = { workspace = true }
+sha2 = { workspace = true }
+log = { workspace = true, optional = true }
+esp-rom-sys = { version = "0.1.5", features = ["esp32"], optional = true }
+
+[dev-dependencies]
+embassy-boot-esp = { path = ".", features = ["std"] }
+critical-section = { version = "1", features = ["std"] }

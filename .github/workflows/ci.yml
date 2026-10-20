@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    name: Host tests (core logic, bootloader logic, tooling)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p thermostat-core -p embassy-boot-esp -p xtask --all-targets --features embassy-boot-esp/std -- -D warnings
+      - run: cargo test -p thermostat-core -p embassy-boot-esp -p xtask --features embassy-boot-esp/std
+
+  firmware:
+    name: Firmware build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [wifi, qemu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: false
+          buildtargets: esp32
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask build --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.target }}
+          path: target/images/${{ matrix.target }}/
+
+  qemu-e2e:
+    name: End-to-end tests in QEMU
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: false
+          buildtargets: esp32
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache patched QEMU
+        id: qemu-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/esp-qemu/patched
+          key: esp-qemu-${{ hashFiles('tools/qemu/*.patch', 'tools/qemu/build.sh') }}
+      - name: Build patched QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build python3-venv pkg-config \
+            libglib2.0-dev libpixman-1-dev libslirp-dev libgcrypt20-dev
+          tools/qemu/build.sh
+      - name: Install QEMU runtime libraries
+        if: steps.qemu-cache.outputs.cache-hit == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libslirp0 libpixman-1-0
+      - run: cargo xtask test-qemu
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-console-log
+          path: target/e2e/console.log

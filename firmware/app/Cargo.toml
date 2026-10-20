@@ -1,0 +1,52 @@
+[package]
+name = "thermostat-firmware"
+description = "ESP32 thermostat application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "thermostat-firmware"
+test = false
+bench = false
+
+[features]
+default = []
+# Run in Espressif QEMU: networking over the emulated OpenCores Ethernet MAC.
+qemu = ["dep:esp-openeth"]
+# Real hardware: WiFi station, with a setup access point when unconfigured.
+wifi = ["dep:esp-radio", "esp-rtos/esp-radio"]
+# Test hook: never confirm the image, so the bootloader must roll it back.
+fail-selftest = []
+
+[dependencies]
+thermostat-core = { workspace = true }
+embassy-boot-esp = { workspace = true }
+esp-openeth = { workspace = true, optional = true }
+
+esp-hal = { workspace = true, features = ["esp32", "log-04", "unstable"] }
+esp-rtos = { workspace = true, features = ["embassy", "esp-alloc", "esp32", "log-04"] }
+esp-radio = { workspace = true, optional = true, features = ["esp-alloc", "esp32", "log-04", "unstable", "wifi"] }
+esp-alloc = { workspace = true, features = ["esp32"] }
+esp-println = { workspace = true, features = ["esp32", "log-04"] }
+esp-storage = { workspace = true, features = ["esp32", "embedded-storage"] }
+
+embassy-executor = { workspace = true, features = ["log"] }
+embassy-time = { workspace = true, features = ["log"] }
+embassy-net = { workspace = true, features = ["dhcpv4", "dhcpv4-hostname", "log", "medium-ethernet", "tcp", "udp", "proto-ipv4", "multicast"] }
+embassy-sync = { workspace = true }
+embassy-futures = { workspace = true }
+embassy-embedded-hal = { workspace = true }
+embedded-io-async = { workspace = true }
+embedded-storage = { workspace = true }
+heapless = { workspace = true }
+static_cell = { workspace = true }
+embassy-boot = { workspace = true }
+edge-mdns = { workspace = true }
+edge-nal = { workspace = true }
+edge-nal-embassy = { workspace = true }
+critical-section = "1.2"
+# Answer ICMP echo (ping); embassy-net builds smoltcp without it.
+smoltcp = { version = "0.13", default-features = false, features = ["auto-icmp-echo-reply"] }
+log = { workspace = true }

@@ -1,0 +1,7 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
+[env]
+ESP_LOG = "info"
+# QEMU reports chip revision v0.0 and older boards are v1.x; nothing here needs v3.
+ESP_HAL_CONFIG_MIN_CHIP_REVISION = "0"

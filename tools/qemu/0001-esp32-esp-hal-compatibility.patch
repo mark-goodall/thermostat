@@ -1,0 +1,172 @@
+diff --git a/hw/timer/esp32_timg.c b/hw/timer/esp32_timg.c
+index f0f0d64..05d1261 100644
+--- a/hw/timer/esp32_timg.c
++++ b/hw/timer/esp32_timg.c
+@@ -351,9 +351,9 @@ static void esp32_timg_timer_cb(void *opaque)
+ 
+     if (ts->level_int_en) {
+         s->int_raw |= int_mask;
+-        if (s->int_ena & int_mask) {
+-            qemu_irq_raise(get_level_irq(s, ts->int_type));
+-        }
++        /* On the ESP32, INT_ENA does not gate the level interrupt lines (esp-hal relies on
++         * this and only sets Tx_LEVEL_INT_EN); the line follows the raw status. */
++        qemu_irq_raise(get_level_irq(s, ts->int_type));
+     }
+ 
+     if (ts->edge_int_en) {
+@@ -383,7 +383,8 @@ static void esp32_timg_int_update_inttype(Esp32TimgState *s, uint32_t int_st, Es
+ 
+ static void esp32_timg_int_update(Esp32TimgState *s)
+ {
+-    uint32_t int_st = s->int_ena & s->int_raw;
++    /* See esp32_timg_timer_cb: level lines are not gated by INT_ENA on the ESP32. */
++    uint32_t int_st = s->int_raw;
+     esp32_timg_int_update_inttype(s, int_st, TIMG_T0_INT);
+     esp32_timg_int_update_inttype(s, int_st, TIMG_T1_INT);
+     esp32_timg_int_update_inttype(s, int_st, TIMG_WDT_INT);
+@@ -473,8 +474,11 @@ static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_n
+     int64_t count_to_alarm = ((int64_t) ts->alarm_val - (int64_t) ts->count_base)
+                                 * esp32_timg_timer_direction(ts);
+     if (count_to_alarm <= 0) {
+-        /* ignore overflow modulo 64 bits */
+-        timer_del(&ts->alarm_timer);
++        /* The counter already passed the alarm value: this happens when the guest arms a
++         * short alarm and emulation is slower than the virtual clock. On hardware the
++         * register writes are fast enough for the alarm to be hit, so fire it now rather
++         * than losing it (esp-hal/esp-rtos depend on this). */
++        timer_mod_anticipate_ns(&ts->alarm_timer, ns_now);
+         return;
+     }
+ 
+diff --git a/hw/xtensa/esp32.c b/hw/xtensa/esp32.c
+index e000470..44e58dc 100644
+--- a/hw/xtensa/esp32.c
++++ b/hw/xtensa/esp32.c
+@@ -349,6 +349,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
+     qdev_realize(DEVICE(&s->intmatrix), &s->periph_bus, &error_fatal);
+     DeviceState* intmatrix_dev = DEVICE(&s->intmatrix);
+     memory_region_add_subregion_overlap(dport_mem, ESP32_DPORT_PRO_INTMATRIX_BASE, sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->intmatrix), 0), -1);
++    /* DPORT_PRO_INTR_STATUS_0_REG (0x3ff000ec) .. DPORT_APP_INTR_STATUS_2_REG */
++    memory_region_add_subregion_overlap(dport_mem, 0xec, sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->intmatrix), 1), 1);
+ 
+     bool init_cache_err = false;
+     if (s->dport.flash_blk) {
+diff --git a/hw/xtensa/esp32_intc.c b/hw/xtensa/esp32_intc.c
+index fed7cf7..6ed3ddb 100644
+--- a/hw/xtensa/esp32_intc.c
++++ b/hw/xtensa/esp32_intc.c
+@@ -22,20 +22,37 @@
+ 
+ #define IRQ_MAP(cpu, input) s->irq_map[cpu][input]
+ 
++/* A CPU interrupt line is the OR of every source routed to it. */
++static void esp32_intmatrix_update_line(Esp32IntMatrixState *s, int cpu, int out_index)
++{
++    if (s->outputs[cpu] == NULL) {
++        return;
++    }
++    int level = 0;
++    for (int src = 0; src < ESP32_INT_MATRIX_INPUTS; ++src) {
++        if (IRQ_MAP(cpu, src) == out_index && (s->level[src / 32] & (1u << (src % 32)))) {
++            level = 1;
++            break;
++        }
++    }
++    for (int int_index = 0; int_index < s->cpu[cpu]->env.config->nextint; ++int_index) {
++        if (s->cpu[cpu]->env.config->extint[int_index] == out_index) {
++            qemu_set_irq(s->outputs[cpu][int_index], level);
++            break;
++        }
++    }
++}
++
+ static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
+ {
+     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
++    if (level) {
++        s->level[n / 32] |= 1u << (n % 32);
++    } else {
++        s->level[n / 32] &= ~(1u << (n % 32));
++    }
+     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
+-        if (s->outputs[i] == NULL) {
+-            continue;
+-        }
+-        int out_index = IRQ_MAP(i, n);
+-        for (int int_index = 0; int_index < s->cpu[i]->env.config->nextint; ++int_index) {
+-            if (s->cpu[i]->env.config->extint[int_index] == out_index) {
+-                qemu_set_irq(s->outputs[i][int_index], level);
+-                break;
+-            }
+-        }
++        esp32_intmatrix_update_line(s, i, IRQ_MAP(i, n));
+     }
+ }
+ 
+@@ -63,10 +80,33 @@ static void esp32_intmatrix_write(void* opaque, hwaddr addr, uint64_t value, uns
+     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
+     uint8_t* map_entry = get_map_entry(s, addr);
+     if (map_entry != NULL) {
++        int cpu = (addr / sizeof(uint32_t)) / ESP32_INT_MATRIX_INPUTS;
++        uint8_t old_index = *map_entry;
+         *map_entry = value & 0x1f;
++        if (old_index != *map_entry && cpu < ESP32_CPU_COUNT) {
++            esp32_intmatrix_update_line(s, cpu, old_index);
++            esp32_intmatrix_update_line(s, cpu, *map_entry);
++        }
+     }
+ }
+ 
++/* DPORT_PRO_INTR_STATUS_0..2 followed by DPORT_APP_INTR_STATUS_0..2 */
++static uint64_t esp32_intmatrix_status_read(void* opaque, hwaddr addr, unsigned int size)
++{
++    Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
++    return s->level[(addr / sizeof(uint32_t)) % ARRAY_SIZE(s->level)];
++}
++
++static void esp32_intmatrix_status_write(void* opaque, hwaddr addr, uint64_t value, unsigned int size)
++{
++}
++
++static const MemoryRegionOps esp_intmatrix_status_ops = {
++    .read =  esp32_intmatrix_status_read,
++    .write = esp32_intmatrix_status_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
+ static const MemoryRegionOps esp_intmatrix_ops = {
+     .read =  esp32_intmatrix_read,
+     .write = esp32_intmatrix_write,
+@@ -77,6 +117,7 @@ static void esp32_intmatrix_reset_hold(Object *obj, ResetType type)
+ {
+     Esp32IntMatrixState *s = ESP32_INTMATRIX(obj);
+     memset(s->irq_map, INTMATRIX_UNINT_VALUE, sizeof(s->irq_map));
++    memset(s->level, 0, sizeof(s->level));
+     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
+         if (s->outputs[i] == NULL) {
+             continue;
+@@ -108,6 +149,9 @@ static void esp32_intmatrix_init(Object *obj)
+     memory_region_init_io(&s->iomem, obj, &esp_intmatrix_ops, s,
+                           TYPE_ESP32_INTMATRIX, ESP32_INT_MATRIX_INPUTS * ESP32_CPU_COUNT * sizeof(uint32_t));
+     sysbus_init_mmio(sbd, &s->iomem);
++    memory_region_init_io(&s->status_iomem, obj, &esp_intmatrix_status_ops, s,
++                          TYPE_ESP32_INTMATRIX ".status", 6 * sizeof(uint32_t));
++    sysbus_init_mmio(sbd, &s->status_iomem);
+ 
+     qdev_init_gpio_in(DEVICE(s), esp32_intmatrix_irq_handler, ESP32_INT_MATRIX_INPUTS);
+ }
+diff --git a/include/hw/xtensa/esp32_intc.h b/include/hw/xtensa/esp32_intc.h
+index 262dbd1..88766ed 100644
+--- a/include/hw/xtensa/esp32_intc.h
++++ b/include/hw/xtensa/esp32_intc.h
+@@ -34,6 +34,9 @@ typedef struct Esp32IntMatrixState {
+     MemoryRegion iomem;
+     qemu_irq *outputs[ESP32_CPU_COUNT];
+     uint8_t irq_map[ESP32_CPU_COUNT][ESP32_INT_MATRIX_INPUTS];
++    /* Raw level of every interrupt source, as reported by DPORT_{PRO,APP}_INTR_STATUS_n */
++    MemoryRegion status_iomem;
++    uint32_t level[(ESP32_INT_MATRIX_INPUTS + 31) / 32];
+ 
+     /* properties */
+     XtensaCPU *cpu[ESP32_CPU_COUNT];

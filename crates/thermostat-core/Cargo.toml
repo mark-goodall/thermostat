@@ -1,0 +1,26 @@
+[package]
+name = "thermostat-core"
+description = "Hardware-independent thermostat logic: settings, auth, web UI, update protocols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+heapless = { workspace = true }
+sha2 = { workspace = true }
+sha1 = { version = "0.10", default-features = false }
+hmac = { workspace = true }
+pbkdf2 = { workspace = true }
+crc = { workspace = true }
+embedded-storage = { workspace = true }
+embedded-io-async = { workspace = true }
+httparse = { version = "1", default-features = false }
+log = { workspace = true }
+
+[dev-dependencies]
+thermostat-core = { path = ".", features = ["std"] }
+futures-executor = "0.3"

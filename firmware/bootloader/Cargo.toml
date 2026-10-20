@@ -1,0 +1,15 @@
+[package]
+name = "thermostat-bootloader"
+description = "Second-stage bootloader for the thermostat (embassy-boot-esp)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "thermostat-bootloader"
+test = false
+bench = false
+
+[dependencies]
+embassy-boot-esp = { workspace = true, features = ["bootloader"] }

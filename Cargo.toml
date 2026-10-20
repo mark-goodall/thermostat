@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = ["crates/embassy-boot-esp", "crates/thermostat-core", "crates/esp-openeth", "firmware/bootloader", "firmware/app", "xtask"]
+# Crates that build and test on the host. Firmware crates are built through
+# `cargo xtask` with the Xtensa toolchain.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+thermostat-core = { path = "crates/thermostat-core" }
+embassy-boot-esp = { path = "crates/embassy-boot-esp" }
+esp-openeth = { path = "crates/esp-openeth" }
+
+embassy-boot = "0.7"
+embassy-embedded-hal = "0.6"
+embassy-executor = "0.10"
+embassy-futures = "0.1"
+embassy-net = "0.9"
+embassy-net-driver = "0.2"
+edge-mdns = { version = "0.8", default-features = false, features = ["io"] }
+edge-nal = "0.7"
+edge-nal-embassy = { version = "0.9", default-features = false, features = ["udp", "multicast", "proto-ipv4", "medium-ethernet"] }
+embassy-sync = "0.8"
+embassy-time = "0.5"
+embedded-io-async = "0.7"
+embedded-storage = "0.3"
+esp-alloc = "0.11"
+esp-backtrace = "0.20"
+esp-hal = "1.2"
+esp-println = "0.18"
+esp-radio = "=1.0.0-beta.1"
+esp-rtos = "0.4"
+esp-storage = "0.10"
+sequential-storage = "8"
+static_cell = "2"
+heapless = "0.9"
+crc = "3"
+sha2 = { version = "0.10", default-features = false }
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+log = "0.4"
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+opt-level = "s"
+debug = 2
+lto = "fat"
+codegen-units = 1
