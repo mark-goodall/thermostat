@@ -24,6 +24,11 @@ use heapless::String;
 use crate::device::{Handle, VERSION};
 
 const MDNS_PACKET: usize = 1500;
+const ADDRESS_POLL: Duration = Duration::from_secs(2);
+
+fn current_ip(stack: Stack<'_>) -> Option<Ipv4Addr> {
+    stack.config_v4().map(|c| c.address.address())
+}
 
 /// edge-mdns' `ServiceAnswers` also emit the host's address records; drop them
 /// so the address is announced once, by the `Host` entry.
@@ -63,11 +68,13 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
     let send_buf = VecBufAccess::<NoopRawMutex, MDNS_PACKET>::new();
 
     loop {
-        stack.wait_config_up().await;
-        let Some(ip) = stack.config_v4().map(|c| c.address.address()) else {
+        // Poll rather than `stack.wait_config_up()`: embassy-net keeps a single
+        // waker for config changes, and two tasks waiting on it (link_monitor
+        // already does) wake each other forever, pinning the CPU.
+        let Some(ip) = current_ip(stack) else {
+            Timer::after(ADDRESS_POLL).await;
             continue;
         };
-        let ip: Ipv4Addr = ip.into();
 
         let host = Host {
             hostname: &hostname,
@@ -129,9 +136,14 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
         );
         log::info!("mdns: http://{hostname}.local/ ({ip})");
 
+        let address_changed = async {
+            while current_ip(stack) == Some(ip) {
+                Timer::after(ADDRESS_POLL).await;
+            }
+        };
         match select(
             mdns.run(HostAnswersMdnsHandler::new(answers)),
-            stack.wait_config_down(),
+            address_changed,
         )
         .await
         {
@@ -140,8 +152,8 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
                 Timer::after(Duration::from_secs(1)).await;
             }
             Either::First(Ok(())) => {}
-            // Address lost (e.g. WiFi dropped): wait for the new one.
-            Either::Second(()) => {}
+            // Address lost or changed (e.g. WiFi dropped): re-announce.
+            Either::Second(()) => log::info!("mdns: address changed"),
         }
     }
 }
