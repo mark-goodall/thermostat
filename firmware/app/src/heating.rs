@@ -17,9 +17,14 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
         let (heat, room, reason) = dev.with(|d| {
             let room = room_temperature(&d.ble, &d.settings.temp_sensors, now);
             d.room = room;
-            let heat =
-                d.thermostat
-                    .update(room, d.settings.setpoint_dc, d.settings.hysteresis_dc, now);
+            let min_switch_ms = d.settings.min_switch_min as u64 * 60_000;
+            let heat = d.thermostat.update(
+                room,
+                d.settings.setpoint_dc,
+                d.settings.hysteresis_dc,
+                min_switch_ms,
+                now,
+            );
             (heat, room, d.thermostat.reason.as_str())
         });
         if heat {

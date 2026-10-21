@@ -84,9 +84,13 @@ pub async fn handle<S: Read + Write, P: Platform>(
                     }
                     write!(
                         w,
-                        ",\"sensors_used\":{},\"heating\":{},\"heating_reason\":\"{}\"",
-                        st.sensors_used, st.heating, st.heating_reason
+                        ",\"sensors_used\":{},\"heating\":{},\"heating_reason\":\"{}\",\"min_switch_min\":{}",
+                        st.sensors_used, st.heating, st.heating_reason, s.min_switch_min
                     )?;
+                    match st.hold_remaining_s {
+                        Some(r) => write!(w, ",\"hold_remaining_s\":{r}")?,
+                        None => w.write_str(",\"hold_remaining_s\":null")?,
+                    }
                     match (st.unix_time, st.time_synced_ago_s) {
                         (Some(t), Some(ago)) => {
                             let tz = crate::clock::TimeZone::parse(&s.timezone).unwrap_or(crate::clock::TimeZone::UTC);
@@ -377,7 +381,16 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
     }
     s.hysteresis_dc = hyst as u16;
 
-    // Older forms (and scripts) may omit the time fields: keep the stored values.
+    // Older forms (and scripts) may omit these fields: keep the stored values.
+    if let Some(raw) = http::form_value(form, "min_switch") {
+        let v: String<8> = http::url_decode(raw).ok_or("Invalid minimum switch time.")?;
+        s.min_switch_min = v
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|m| *m <= crate::control::MAX_MIN_SWITCH_MIN)
+            .ok_or("Minimum time between switches must be 0 to 1440 minutes.")?;
+    }
     if let Some(raw) = http::form_value(form, "ntp_server") {
         let server: String<48> = http::url_decode(raw).ok_or("NTP server is too long.")?;
         crate::sntp::split_server(&server)
@@ -645,10 +658,15 @@ fn status_page(
     }
     write!(
         w,
-        "</td></tr><tr><td>Heating</td><td><b>{}</b> <small>({})</small></td></tr><tr><td>Time</td><td>",
+        "</td></tr><tr><td>Heating</td><td><b>{}</b> <small>({}",
         if st.heating { "ON" } else { "off" },
         st.heating_reason
     )?;
+    if let Some(r) = st.hold_remaining_s {
+        let m = r.div_ceil(60);
+        write!(w, ", {} h {:02} min left", m / 60, m % 60)?;
+    }
+    w.write_str(")</small></td></tr><tr><td>Time</td><td>")?;
     match (st.unix_time, st.time_synced_ago_s) {
         (Some(t), Some(ago)) => {
             let tz =
@@ -770,7 +788,9 @@ fn settings_form(
 <label>WiFi password{}<input type=password name=wifi_password maxlength=63 autocomplete=new-password></label>\
 </fieldset><fieldset><legend>Thermostat</legend>\
 <label>Setpoint (°C)<input name=setpoint value=\"{}\" inputmode=decimal></label>\
-<label>Hysteresis (°C)<input name=hysteresis value=\"{}\" inputmode=decimal></label>\
+<label>Hysteresis (°C): on at setpoint − half, off at setpoint + half<input name=hysteresis value=\"{}\" inputmode=decimal></label>\
+<label>Minimum time between heating switches (minutes, 0 = off, default 240 = 4 h)\
+<input name=min_switch value=\"{}\" inputmode=numeric></label>\
 </fieldset><fieldset><legend>Time</legend>\
 <label>NTP server (host or host:port)<input name=ntp_server value=\"{}\" maxlength=48 required></label>\
 <label>Timezone (POSIX TZ, e.g. GMT0BST,M3.5.0/1,M10.5.0 · CET-1CEST,M3.5.0,M10.5.0/3 · EST5EDT,M3.2.0,M11.1.0 · UTC0)\
@@ -784,6 +804,7 @@ fn settings_form(
         },
         Tenths(s.setpoint_dc as i32),
         Tenths(s.hysteresis_dc as i32),
+        s.min_switch_min,
         Escape(&s.ntp_server),
         Escape(&s.timezone),
     )?;
@@ -996,6 +1017,7 @@ mod tests {
         sessions: crate::auth::Sessions,
         ble: Option<crate::ble::BleTable>,
         time: Option<i64>,
+        hold: Option<u64>,
     }
 
     impl Ota for Fake {
@@ -1043,6 +1065,7 @@ mod tests {
                 sensors_used: 0,
                 heating: false,
                 heating_reason: "no sensor reading",
+                hold_remaining_s: self.hold,
                 unix_time: self.time,
                 time_synced_ago_s: self.time.map(|_| 42),
             }
@@ -1503,5 +1526,50 @@ mod tests {
         // Forms without the fields keep the stored values.
         post(&mut p, "/settings", &cookie, base.as_bytes());
         assert_eq!(p.settings.timezone, "GMT0BST,M3.5.0/1,M10.5.0");
+    }
+
+    #[test]
+    fn short_cycle_setting() {
+        let (mut p, cookie) = provisioned();
+        assert_eq!(p.settings.min_switch_min, 240, "default is 4 hours");
+        let html = get(&mut p, "/settings", &cookie).text();
+        assert!(html.contains("name=min_switch value=\"240\""), "{html}");
+        let base = "hostname=t&ssid=&setpoint=20.0&hysteresis=1.5";
+        assert!(
+            post(
+                &mut p,
+                "/settings",
+                &cookie,
+                std::format!("{base}&min_switch=90").as_bytes()
+            )
+            .text()
+            .contains("Saved")
+        );
+        assert_eq!(
+            (p.settings.min_switch_min, p.settings.hysteresis_dc),
+            (90, 15)
+        );
+        for bad in ["1441", "-5", "abc"] {
+            let r = post(
+                &mut p,
+                "/settings",
+                &cookie,
+                std::format!("{base}&min_switch={bad}").as_bytes(),
+            );
+            assert!(r.text().contains("0 to 1440"), "{bad}");
+        }
+        post(&mut p, "/settings", &cookie, base.as_bytes());
+        assert_eq!(
+            p.settings.min_switch_min, 90,
+            "omitted field keeps the value"
+        );
+
+        p.hold = Some(83 * 60 + 10);
+        assert!(get(&mut p, "/", &cookie).text().contains("1 h 24 min left"));
+        let json = get(&mut p, "/api/status", "").text();
+        assert!(
+            json.contains("\"min_switch_min\":90") && json.contains("\"hold_remaining_s\":4990"),
+            "{json}"
+        );
     }
 }

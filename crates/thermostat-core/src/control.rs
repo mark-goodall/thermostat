@@ -5,9 +5,11 @@ use crate::ble::BleTable;
 
 /// A sensor reading older than this is ignored.
 pub const READING_MAX_AGE_MS: u64 = 10 * 60 * 1000;
-/// Minimum time between switching the heating on/off (protects boilers and
-/// relays from short-cycling). Losing all readings still switches off at once.
-pub const MIN_SWITCH_INTERVAL_MS: u64 = 2 * 60 * 1000;
+/// Default minimum time between switching the heating on/off, in minutes
+/// (short-cycle protection; configurable in the settings).
+pub const DEFAULT_MIN_SWITCH_MIN: u16 = 4 * 60;
+/// Upper limit for the configurable minimum switch interval (one day).
+pub const MAX_MIN_SWITCH_MIN: u16 = 24 * 60;
 
 // The BLE table must keep a device longer than its reading stays valid,
 // otherwise the table, not the age rule, decides when a sensor drops out.
@@ -70,6 +72,8 @@ pub enum Reason {
 pub struct Thermostat {
     heating: bool,
     last_switch_ms: Option<u64>,
+    /// While holding: when the pending switch becomes allowed.
+    hold_until_ms: Option<u64>,
     pub reason: Reason,
 }
 
@@ -84,6 +88,7 @@ impl Thermostat {
         Self {
             heating: false,
             last_switch_ms: None,
+            hold_until_ms: None,
             reason: Reason::NoReading,
         }
     }
@@ -92,16 +97,27 @@ impl Thermostat {
         self.heating
     }
 
+    /// Milliseconds until a pending (held back) switch is allowed.
+    pub fn hold_remaining_ms(&self, now_ms: u64) -> Option<u64> {
+        match self.reason {
+            Reason::Holding => self.hold_until_ms.map(|t| t.saturating_sub(now_ms)),
+            _ => None,
+        }
+    }
+
     /// Decide whether to heat. Heating turns on at or below
     /// `setpoint - hysteresis/2` and off at or above `setpoint + hysteresis/2`
-    /// (tenths of °C).
+    /// (tenths of °C). Switches are at least `min_switch_ms` apart, except
+    /// that losing all readings switches off at once.
     pub fn update(
         &mut self,
         room: Option<RoomTemperature>,
         setpoint_dc: i16,
         hysteresis_dc: u16,
+        min_switch_ms: u64,
         now_ms: u64,
     ) -> bool {
+        self.hold_until_ms = None;
         let Some(room) = room else {
             self.reason = Reason::NoReading;
             if self.heating {
@@ -121,13 +137,12 @@ impl Thermostat {
         };
         self.reason = reason;
         if want != self.heating {
-            let allowed = self
-                .last_switch_ms
-                .is_none_or(|last| now_ms.saturating_sub(last) >= MIN_SWITCH_INTERVAL_MS);
-            if allowed {
-                self.switch(want, now_ms);
-            } else {
-                self.reason = Reason::Holding;
+            match self.last_switch_ms {
+                Some(last) if now_ms.saturating_sub(last) < min_switch_ms => {
+                    self.reason = Reason::Holding;
+                    self.hold_until_ms = Some(last + min_switch_ms);
+                }
+                _ => self.switch(want, now_ms),
             }
         }
         self.heating
@@ -161,6 +176,8 @@ mod tests {
         v.extend_from_slice(&[0x88, 0x13, 0x86, 0x0B, 90, 1, 0]);
         v
     }
+
+    const MIN: u64 = 2 * 60_000;
 
     fn room(t_cc: i32) -> Option<RoomTemperature> {
         Some(RoomTemperature {
@@ -208,34 +225,51 @@ mod tests {
     fn hysteresis_band() {
         let mut th = Thermostat::new();
         // Setpoint 20.0, hysteresis 1.0: on at <= 19.5, off at >= 20.5.
-        assert!(!th.update(room(1960), 200, 10, 0));
+        assert!(!th.update(room(1960), 200, 10, MIN, 0));
         assert_eq!(th.reason, Reason::InBand);
-        assert!(th.update(room(1950), 200, 10, 0));
+        assert!(th.update(room(1950), 200, 10, MIN, 0));
         assert!(
-            th.update(room(2040), 200, 10, 10 * 60_000),
+            th.update(room(2040), 200, 10, MIN, 10 * 60_000),
             "stays on inside the band"
         );
-        assert!(!th.update(room(2050), 200, 10, 20 * 60_000));
+        assert!(!th.update(room(2050), 200, 10, MIN, 20 * 60_000));
         assert_eq!(th.reason, Reason::AboveBand);
     }
 
     #[test]
     fn minimum_switch_interval() {
         let mut th = Thermostat::new();
-        assert!(th.update(room(1800), 200, 10, 0));
+        assert!(th.update(room(1800), 200, 10, MIN, 0));
         // Overshoot right away: holds until the interval passes.
-        assert!(th.update(room(2200), 200, 10, 30_000));
+        assert!(th.update(room(2200), 200, 10, MIN, 30_000));
         assert_eq!(th.reason, Reason::Holding);
-        assert!(!th.update(room(2200), 200, 10, MIN_SWITCH_INTERVAL_MS));
+        assert_eq!(th.hold_remaining_ms(30_000), Some(MIN - 30_000));
+        assert!(!th.update(room(2200), 200, 10, MIN, MIN));
+        assert_eq!(th.hold_remaining_ms(MIN), None);
+    }
+
+    #[test]
+    fn four_hour_default_interval() {
+        let four_h = DEFAULT_MIN_SWITCH_MIN as u64 * 60_000;
+        let mut th = Thermostat::new();
+        assert!(
+            th.update(room(1800), 200, 10, four_h, 0),
+            "first switch is immediate"
+        );
+        assert!(th.update(room(2200), 200, 10, four_h, 3 * 3_600_000));
+        assert_eq!(th.hold_remaining_ms(3 * 3_600_000), Some(3_600_000));
+        assert!(!th.update(room(2200), 200, 10, four_h, four_h));
+        // Zero disables the protection.
+        assert!(th.update(room(1800), 200, 10, 0, four_h + 1));
     }
 
     #[test]
     fn fails_safe_without_readings() {
         let mut th = Thermostat::new();
-        assert!(th.update(room(1800), 200, 10, 0));
+        assert!(th.update(room(1800), 200, 10, MIN, 0));
         // Losing the sensor switches off immediately, despite the interval.
-        assert!(!th.update(None, 200, 10, 1_000));
+        assert!(!th.update(None, 200, 10, MIN, 1_000));
         assert_eq!(th.reason, Reason::NoReading);
-        assert!(!th.update(None, 200, 10, 10 * 60_000));
+        assert!(!th.update(None, 200, 10, MIN, 10 * 60_000));
     }
 }

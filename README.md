@@ -68,9 +68,13 @@ A change takes effect after a reboot.
   The page lists sensors currently heard that report a temperature, plus any
   already selected. The room temperature is the average of their readings
   newer than 10 minutes.
-- **Hysteresis.** Heating turns on at or below `setpoint − hysteresis/2` and off
-  at or above `setpoint + hysteresis/2`.
-- **Short-cycle protection.** Switches are at least 2 minutes apart.
+- **Hysteresis** (settings page, 0.1–5.0 °C). Heating turns on at or below
+  `setpoint − hysteresis/2` and off at or above `setpoint + hysteresis/2`.
+- **Short-cycle protection** (settings page, minutes; default 240 = 4 h, 0
+  disables it, maximum 1440). Switches are at least this far apart; the
+  status page shows the time left while a switch is held back. The first
+  switch after boot is immediate, since the interval is not persisted across
+  reboots.
 - **Fail-safe.** With no fresh reading from any selected sensor, or none
   selected, heating is off at once.
 - **Output.** Heat demand drives GPIO2, active high. That is the on-board LED on

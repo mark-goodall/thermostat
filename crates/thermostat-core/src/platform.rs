@@ -77,6 +77,8 @@ pub struct DeviceStatus {
     pub heating: bool,
     /// Why the heating is in its current state.
     pub heating_reason: &'static str,
+    /// Seconds until a held-back switch is allowed (short-cycle protection).
+    pub hold_remaining_s: Option<u64>,
     /// Unix time (seconds), once NTP has synchronised.
     pub unix_time: Option<i64>,
     /// Seconds since the last successful NTP sync.

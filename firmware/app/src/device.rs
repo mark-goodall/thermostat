@@ -208,6 +208,10 @@ impl Platform for Handle {
             sensors_used: d.room.map_or(0, |r| r.sensors),
             heating: d.thermostat.heating(),
             heating_reason: d.thermostat.reason.as_str(),
+            hold_remaining_s: d
+                .thermostat
+                .hold_remaining_ms(Instant::now().as_millis())
+                .map(|ms| ms / 1000),
             unix_time: d.clock.unix_s(Instant::now().as_micros()),
             time_synced_ago_s: d.clock.since_sync_s(Instant::now().as_micros()),
         })
