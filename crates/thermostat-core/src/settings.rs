@@ -4,7 +4,7 @@
 //! tags are skipped on decode, so firmware versions can add settings without
 //! breaking older or newer images sharing the same partition.
 
-use heapless::String;
+use heapless::{String, Vec};
 
 use crate::auth::PasswordHash;
 
@@ -32,7 +32,11 @@ pub struct Settings {
     pub setpoint_dc: i16,
     /// Switching hysteresis in tenths of a degree Celsius.
     pub hysteresis_dc: u16,
+    /// BLE sensors (addresses in on-air byte order) whose readings drive the thermostat.
+    pub temp_sensors: Vec<[u8; 6], MAX_TEMP_SENSORS>,
 }
+
+pub const MAX_TEMP_SENSORS: usize = 4;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -44,6 +48,7 @@ impl Default for Settings {
             admin_hash: None,
             setpoint_dc: 200,
             hysteresis_dc: 5,
+            temp_sensors: Vec::new(),
         }
     }
 }
@@ -72,6 +77,7 @@ mod tag {
     pub const ADMIN_HASH: u8 = 5;
     pub const SETPOINT: u8 = 6;
     pub const HYSTERESIS: u8 = 7;
+    pub const TEMP_SENSORS: u8 = 8;
 }
 
 struct Writer<'a> {
@@ -104,6 +110,13 @@ impl Settings {
         }
         w.field(tag::SETPOINT, &self.setpoint_dc.to_le_bytes());
         w.field(tag::HYSTERESIS, &self.hysteresis_dc.to_le_bytes());
+        if !self.temp_sensors.is_empty() {
+            let mut addrs = [0u8; 6 * MAX_TEMP_SENSORS];
+            for (i, a) in self.temp_sensors.iter().enumerate() {
+                addrs[i * 6..i * 6 + 6].copy_from_slice(a);
+            }
+            w.field(tag::TEMP_SENSORS, &addrs[..self.temp_sensors.len() * 6]);
+        }
         w.pos
     }
 
@@ -140,6 +153,15 @@ impl Settings {
                     s.hysteresis_dc =
                         u16::from_le_bytes(v.try_into().map_err(|_| DecodeError::BadValue)?)
                 }
+                tag::TEMP_SENSORS => {
+                    if v.len() % 6 != 0 {
+                        return Err(DecodeError::BadValue);
+                    }
+                    s.temp_sensors.clear();
+                    for a in v.as_chunks::<6>().0.iter().take(MAX_TEMP_SENSORS) {
+                        let _ = s.temp_sensors.push(*a);
+                    }
+                }
                 _ => {} // from a newer firmware; ignore
             }
         }
@@ -171,6 +193,7 @@ mod tests {
                 hash: [2; 32],
             }),
             setpoint_dc: -15,
+            temp_sensors: Vec::from_slice(&[[1, 2, 3, 4, 5, 6], [9; 6]]).unwrap(),
             ..Settings::default()
         };
         let mut buf = [0u8; MAX_ENCODED];
@@ -197,6 +220,7 @@ mod tests {
             hostname: str32(&"h".repeat(40)),
             wifi_ssid: str32(&"s".repeat(40)),
             admin_user: str32(&"u".repeat(40)),
+            temp_sensors: Vec::from_slice(&[[0xAA; 6]; MAX_TEMP_SENSORS]).unwrap(),
             wifi_psk: Some([0; 32]),
             admin_hash: Some(PasswordHash {
                 salt: [0; 16],

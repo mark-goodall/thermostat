@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod ble;
 pub mod codec;
+pub mod control;
 pub mod dhcp;
 pub mod http;
 pub mod platform;

@@ -4,10 +4,10 @@ Rust firmware for an ESP32 thermostat, built on esp-hal + embassy, with
 power-fail-safe over-the-air updates through **embassy-boot-esp**, a Rust
 second-stage bootloader.
 
-Status: groundwork. Implemented so far are the bootloader, the update paths
+Status: early but functional. Implemented so far are the bootloader, the update paths
 (HTTP and serial), the settings store with its web pages, and emulator-based
-testing. The thermostat control loop is still a placeholder: setpoint and
-hysteresis are stored, but no sensor or relay is driven yet.
+testing. Heating is controlled from BLE temperature sensors (see "Heating control"),
+driving GPIO2 as a stand-in for a relay output.
 
 ## Layout
 
@@ -62,9 +62,37 @@ curl http://<hostname>.local/api/status
 The hostname is set on the settings page or with `xtask provision --hostname`.
 A change takes effect after a reboot.
 
+## Heating control
+
+- **Sensors.** On the settings page, check up to 4 BLE temperature sensors.
+  The page lists sensors currently heard that report a temperature, plus any
+  already selected. The room temperature is the average of their readings
+  newer than 10 minutes.
+- **Hysteresis.** Heating turns on at or below `setpoint − hysteresis/2` and off
+  at or above `setpoint + hysteresis/2`.
+- **Short-cycle protection.** Switches are at least 2 minutes apart.
+- **Fail-safe.** With no fresh reading from any selected sensor, or none
+  selected, heating is off at once.
+- **Output.** Heat demand drives GPIO2, active high. That is the on-board LED on
+  many ESP32 dev boards; put a relay driver there (or change the pin in
+  `main.rs`).
+- **Status.** The status page and `/api/status` show the room temperature, the
+  number of sensors used, the heating state and the reason (`below setpoint`,
+  `within hysteresis band`, `waiting for minimum switch interval`, …).
+
+Logic: `thermostat-core/src/control.rs` (host-tested). Loop: `firmware/app/src/heating.rs` (every 5 s).
+
+Supported sensors:
+
+| sensor | format | notes |
+|---|---|---|
+| ThermoPro TP357/TP357S/TP35x/TP39x | manufacturer data (company-ID field reused) | identified by name, which can arrive in the scan response, so the scanner uses active scanning |
+| Xiaomi LYWSD03MMC etc. with pvvx/ATC firmware | service data `0x181A` | |
+| any BTHome v2 device (unencrypted) | service data `0xFCD2` | |
+
 ## Bluetooth (BLE scanner)
 
-The WiFi build also runs a passive BLE scan on the same radio (esp-radio
+The WiFi build also runs a BLE scan (active, for scan-response names) on the same radio (esp-radio
 `ble` + `coex`). It drives the controller with plain HCI through `bt-hci`, so
 no host stack is needed. `/ble` in the web UI (auto-refreshing) and
 `/api/ble` list nearby advertisers with:
@@ -73,8 +101,8 @@ no host stack is needed. `/ble` in the web UI (auto-refreshing) and
 - 16-bit service UUIDs, with names for common ones
 - packet count and when each was last seen
 
-Readings from BLE thermometers using the pvvx/ATC1441 custom firmware or
-BTHome v2 are decoded into temperature, humidity and battery. Stock Xiaomi
+Readings from supported thermometers (table above) are decoded into
+temperature, humidity and battery. Stock Xiaomi
 MiBeacon (`FE95`) payloads are encrypted and are not decoded.
 
 Bench numbers with WiFi connected:

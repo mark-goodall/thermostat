@@ -130,6 +130,14 @@ pub fn form_value<'a>(form: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// All raw values of a repeated key (e.g. checkboxes), in order.
+pub fn form_values<'a>(form: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    form.split('&').filter_map(move |kv| {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        (k == key).then_some(v)
+    })
+}
+
 /// Percent-decode an urlencoded value (`+` is a space).
 pub fn url_decode<const N: usize>(raw: &str) -> Option<String<N>> {
     let mut bytes = heapless::Vec::<u8, N>::new();
@@ -274,6 +282,11 @@ mod tests {
         assert_eq!(form_field::<32>(form, "absent").unwrap(), "");
         assert!(form_field::<4>(form, "ssid").is_none(), "too long");
         assert!(url_decode::<8>("%zz").is_none());
+        let multi = "a=1&sensor=AA%3A01&b=2&sensor=BB%3A02";
+        assert_eq!(
+            form_values(multi, "sensor").collect::<std::vec::Vec<_>>(),
+            ["AA%3A01", "BB%3A02"]
+        );
     }
 
     #[test]

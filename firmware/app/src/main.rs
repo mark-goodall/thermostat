@@ -12,6 +12,7 @@ extern crate alloc;
 #[cfg(feature = "wifi")]
 mod ble;
 mod device;
+mod heating;
 mod mdns;
 mod net;
 mod serial;
@@ -130,6 +131,14 @@ async fn main(spawner: Spawner) -> ! {
     .await;
 
     spawner.spawn(mdns::task(stack, dev).unwrap());
+    // Heat demand, active high. GPIO2 drives the on-board LED on many ESP32
+    // dev boards, so the state is visible until a relay driver is attached.
+    let heat_output = esp_hal::gpio::Output::new(
+        peripherals.GPIO2,
+        esp_hal::gpio::Level::Low,
+        esp_hal::gpio::OutputConfig::default(),
+    );
+    spawner.spawn(heating::task(heat_output, dev).unwrap());
     #[cfg(feature = "wifi")]
     spawner.spawn(ble::task(peripherals.BT, dev).unwrap());
     for _ in 0..web::TASKS {

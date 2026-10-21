@@ -72,7 +72,8 @@ jobs:
       - name: Install QEMU runtime libraries
         if: steps.qemu-cache.outputs.cache-hit == 'true'
         run: sudo apt-get update && sudo apt-get install -y libslirp0 libpixman-1-0
-      - run: cargo xtask test-qemu
+      # Release builds: what runs on hardware (debug builds also enable esp-rtos debug assertions).
+      - run: cargo xtask test-qemu --release
       - uses: actions/upload-artifact@v4
         if: always()
         with:

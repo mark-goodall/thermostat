@@ -70,8 +70,13 @@ pub struct DeviceStatus {
     pub uptime_s: u64,
     /// Human-readable network state, e.g. "wifi 192.168.1.20" or "ap setup".
     pub network: String<48>,
-    /// Current temperature in tenths of °C, when a sensor is present.
+    /// Room temperature in tenths of °C from the selected sensors, if any is fresh.
     pub temperature_dc: Option<i16>,
+    /// Number of selected sensors that contributed to `temperature_dc`.
+    pub sensors_used: u8,
+    pub heating: bool,
+    /// Why the heating is in its current state.
+    pub heating_reason: &'static str,
 }
 
 pub trait Platform: Ota {

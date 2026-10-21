@@ -2,15 +2,17 @@
 //!
 //! The firmware feeds raw advertising reports from the controller in here;
 //! the web UI renders the table. Common BLE thermometer broadcast formats
-//! (pvvx / ATC1441 custom firmware on Xiaomi sensors, and BTHome v2) are
-//! decoded so remote sensors show their readings.
+//! (pvvx / ATC1441 custom firmware on Xiaomi sensors, BTHome v2, and
+//! ThermoPro TP35x/TP39x) are decoded so remote sensors show their readings.
 
 use heapless::{String, Vec};
 
 /// Devices remembered at once. When full, the least recently seen is replaced.
 pub const MAX_DEVICES: usize = 24;
-/// Devices not heard from for this long are dropped.
-pub const EXPIRY_MS: u64 = 5 * 60 * 1000;
+/// Devices not heard from for this long are dropped. Longer than
+/// `control::READING_MAX_AGE_MS`, so that rule decides when a selected
+/// sensor's reading stops counting.
+pub const EXPIRY_MS: u64 = 15 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrKind {
@@ -62,6 +64,8 @@ pub struct AdvInfo {
     /// First few 16-bit service UUIDs (from UUID lists or service data).
     pub services: Vec<u16, 4>,
     pub sensor: Option<SensorReading>,
+    /// Raw manufacturer specific data, including the 2-byte company ID.
+    pub manufacturer: Option<Vec<u8, 16>>,
 }
 
 /// Parse the AD structures of an advertising (or scan response) payload.
@@ -107,7 +111,8 @@ pub fn parse_adv(data: &[u8]) -> AdvInfo {
                 }
             }
             0xFF if value.len() >= 2 => {
-                info.company = Some(u16::from_le_bytes([value[0], value[1]]))
+                info.company = Some(u16::from_le_bytes([value[0], value[1]]));
+                info.manufacturer = Vec::from_slice(&value[..value.len().min(16)]).ok();
             }
             _ => {}
         }
@@ -170,6 +175,37 @@ fn decode_bthome(d: &[u8]) -> Option<SensorReading> {
     (!r.is_empty()).then_some(r)
 }
 
+/// ThermoPro TP35x / TP39x / TP59 thermo-hygrometers.
+///
+/// They abuse the manufacturer data's company ID field: the whole payload is
+/// `marker, temp i16 LE (0.1 °C), humidity %, battery (low 2 bits), ...`.
+/// Identification needs the advertised name (`TP357 (2142)`), as in
+/// thermopro-ble / Theengs Decoder.
+pub fn decode_thermopro(name: &str, manufacturer: &[u8]) -> Option<SensorReading> {
+    if !(name.starts_with("TP35") || name.starts_with("TP39") || name.starts_with("TP59")) {
+        return None;
+    }
+    let d = manufacturer.get(..5)?;
+    if d[1..4] == [0xFF, 0xFF, 0xFF] {
+        return None; // the TP357S reports this while it has no valid reading
+    }
+    let battery = match d[4] & 3 {
+        0 => Some(1),
+        1 => Some(50),
+        2 => Some(100),
+        _ => None,
+    };
+    Some(SensorReading {
+        temperature_cc: Some(i16::from_le_bytes([d[1], d[2]]).saturating_mul(10)),
+        humidity_cp: Some(d[3] as u16 * 100),
+        battery_pct: battery,
+    })
+}
+
+pub fn is_thermopro(name: Option<&str>) -> bool {
+    name.is_some_and(|n| n.starts_with("TP35") || n.starts_with("TP39") || n.starts_with("TP59"))
+}
+
 /// Names for some common Bluetooth SIG company identifiers.
 pub fn company_name(id: u16) -> Option<&'static str> {
     Some(match id {
@@ -184,7 +220,7 @@ pub fn company_name(id: u16) -> Option<&'static str> {
         0x038F => "Xiaomi",
         0x0499 => "Ruuvi",
         0x0822 => "adafruit",
-        0x0969 => "Govee",
+        0x0969 => "SwitchBot",
         _ => return None,
     })
 }
@@ -215,6 +251,8 @@ pub struct BleDevice {
     pub tx_power: Option<i8>,
     pub services: Vec<u16, 4>,
     pub sensor: Option<SensorReading>,
+    /// When `sensor` was last updated from an advertisement.
+    pub sensor_ms: u64,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub packets: u32,
@@ -223,17 +261,35 @@ pub struct BleDevice {
 impl BleDevice {
     /// Address in the usual most-significant-first notation.
     pub fn addr_string(&self) -> String<17> {
-        let a = self.addr;
-        let mut s = String::new();
-        let _ = core::fmt::write(
-            &mut s,
-            format_args!(
-                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                a[5], a[4], a[3], a[2], a[1], a[0]
-            ),
-        );
-        s
+        format_addr(&self.addr)
     }
+}
+
+/// Parse `AA:BB:CC:DD:EE:FF` (as shown by [`BleDevice::addr_string`]) into
+/// on-air byte order.
+pub fn parse_addr(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for i in (0..6).rev() {
+        let p = parts.next()?;
+        if p.len() != 2 {
+            return None;
+        }
+        out[i] = u8::from_str_radix(p, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
+
+pub fn format_addr(a: &[u8; 6]) -> String<17> {
+    let mut s = String::new();
+    let _ = core::fmt::write(
+        &mut s,
+        format_args!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            a[5], a[4], a[3], a[2], a[1], a[0]
+        ),
+    );
+    s
 }
 
 #[derive(Debug, Default)]
@@ -271,6 +327,7 @@ impl BleTable {
                     tx_power: None,
                     services: Vec::new(),
                     sensor: None,
+                    sensor_ms: 0,
                     first_seen_ms: now_ms,
                     last_seen_ms: now_ms,
                     packets: 0,
@@ -305,9 +362,25 @@ impl BleTable {
                 let _ = dev.services.push(s);
             }
         }
-        if info.sensor.is_some() {
-            dev.sensor = info.sensor;
+        let mut reading = info.sensor;
+        // ThermoPro readings live in the manufacturer data; the name that
+        // identifies the model may have arrived in an earlier scan response.
+        if let (Some(name), Some(mfr)) = (&dev.name, &info.manufacturer)
+            && let Some(r) = decode_thermopro(name, mfr)
+        {
+            reading = Some(r);
         }
+        if is_thermopro(dev.name.as_deref()) {
+            dev.company = None; // the "company ID" is really sensor data
+        }
+        if reading.is_some() {
+            dev.sensor = reading;
+            dev.sensor_ms = now_ms;
+        }
+    }
+
+    pub fn get(&self, addr: &[u8; 6]) -> Option<&BleDevice> {
+        self.devices.iter().find(|d| &d.addr == addr)
     }
 
     pub fn expire(&mut self, now_ms: u64) {
@@ -415,6 +488,57 @@ mod tests {
         );
         // Encrypted payloads are not decoded.
         assert_eq!(decode_service_data(0xFCD2, &[0x41, 0x02, 0, 0]), None);
+    }
+
+    #[test]
+    fn address_text_roundtrip() {
+        let a = [0x01, 0x02, 0x03, 0x04, 0x05, 0xAB];
+        assert_eq!(format_addr(&a).as_str(), "AB:05:04:03:02:01");
+        assert_eq!(parse_addr("ab:05:04:03:02:01"), Some(a));
+        assert_eq!(parse_addr("AB:05:04:03:02"), None);
+        assert_eq!(parse_addr("AB:05:04:03:02:01:00"), None);
+        assert_eq!(parse_addr("AB:05:04:03:02:1"), None);
+        assert_eq!(parse_addr("zz:05:04:03:02:01"), None);
+    }
+
+    #[test]
+    fn decodes_thermopro() {
+        // Test vectors from thermopro-ble / Theengs Decoder.
+        let r = decode_thermopro("TP357 (2142)", &[0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C]).unwrap();
+        assert_eq!(
+            (r.temperature_cc, r.humidity_cp, r.battery_pct),
+            (Some(2410), Some(2900), Some(100))
+        );
+        let r = decode_thermopro("TP357", &[0xC2, 0x10, 0x01, 0x47, 0x02, 0x2C]).unwrap();
+        assert_eq!((r.temperature_cc, r.humidity_cp), (Some(2720), Some(7100)));
+        let r =
+            decode_thermopro("TP357S (3C62)", &[0xC2, 0xD6, 0x00, 0x43, 0x22, 0x0B, 0x01]).unwrap();
+        assert_eq!(
+            (r.temperature_cc, r.humidity_cp, r.battery_pct),
+            (Some(2140), Some(6700), Some(100))
+        );
+        // -3.5 °C (0xFFDD), 50 %, low battery.
+        let r = decode_thermopro("TP357", &[0xC2, 0xDD, 0xFF, 50, 0]).unwrap();
+        assert_eq!((r.temperature_cc, r.battery_pct), (Some(-350), Some(1)));
+        // Invalid marker frame, wrong name, too short.
+        assert!(decode_thermopro("TP357S", &[0xC2, 0xFF, 0xFF, 0xFF, 0x0B]).is_none());
+        assert!(decode_thermopro("Phone", &[0xC2, 0xF1, 0x00, 0x1D, 0x02]).is_none());
+        assert!(decode_thermopro("TP357", &[0xC2, 0xF1, 0x00]).is_none());
+    }
+
+    #[test]
+    fn thermopro_name_from_scan_response() {
+        let mut t = BleTable::new();
+        let a = [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA];
+        let adv = ad(0xFF, &[0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C]);
+        // Advertisement before the name is known: not decoded yet.
+        t.observe(a, 0, -60, &adv, 0);
+        assert_eq!(t.get(&a).unwrap().sensor, None);
+        t.observe(a, 0, -60, &ad(0x09, b"TP357 (2142)"), 100); // scan response
+        t.observe(a, 0, -60, &adv, 2000);
+        let d = t.get(&a).unwrap();
+        assert_eq!(d.sensor.unwrap().temperature_cc, Some(2410));
+        assert_eq!((d.sensor_ms, d.company), (2000, None));
     }
 
     #[test]

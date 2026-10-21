@@ -12,6 +12,7 @@ use esp_storage::FlashStorage;
 use heapless::String;
 use thermostat_core::auth::Sessions;
 use thermostat_core::ble::BleTable;
+use thermostat_core::control::{RoomTemperature, Thermostat};
 use thermostat_core::platform::{BootState, DeviceStatus, Ota, OtaError, Platform};
 use thermostat_core::settings::Settings;
 use thermostat_core::store::{SettingsStore, StoreError};
@@ -41,6 +42,8 @@ pub struct Device {
     pub sessions: Sessions,
     /// Nearby BLE advertisers (filled by the scanner in WiFi builds).
     pub ble: BleTable,
+    pub thermostat: Thermostat,
+    pub room: Option<RoomTemperature>,
     pub boot: BootState,
     pub network: String<48>,
     pub reboot_requested: bool,
@@ -68,6 +71,8 @@ impl Device {
             rng: Rng::new(),
             sessions: Sessions::new(),
             ble: BleTable::new(),
+            thermostat: Thermostat::new(),
+            room: None,
             boot,
             network: String::try_from("starting").unwrap(),
             reboot_requested: false,
@@ -195,7 +200,10 @@ impl Platform for Handle {
             boot: d.boot,
             uptime_s: Instant::now().as_secs(),
             network: d.network.clone(),
-            temperature_dc: None,
+            temperature_dc: d.room.map(|r| r.tenths()),
+            sensors_used: d.room.map_or(0, |r| r.sensors),
+            heating: d.thermostat.heating(),
+            heating_reason: d.thermostat.reason.as_str(),
         })
     }
 

@@ -424,11 +424,15 @@ pub fn run(release: bool) -> Result<()> {
         let mark = emu.mark();
         let (code, body) = emu.request("POST", "/api/update", &auth, &std::fs::read(&bad.img)?)?;
         anyhow::ensure!(code == 200, "upload: {code} {body}");
-        emu.wait_status("trial boot of e2e-bad", Duration::from_secs(120), |s| {
-            field(s, "version") == "e2e-bad"
-        })?;
+        // Watch the console rather than HTTP: a trial image may also fail by
+        // crashing early, before it ever answers a request.
+        emu.wait_log(
+            mark,
+            "state: swapped (trial), image e2e-bad",
+            Duration::from_secs(120),
+        )?;
         // It never confirms; the watchdog resets it and the bootloader reverts.
-        emu.wait_log(mark, "TG0WDT_SYS_RESET", Duration::from_secs(90))?;
+        emu.wait_log(mark, "rst:0x7 (TG0WDT_SYS_RESET)", Duration::from_secs(90))?;
         emu.wait_log(
             mark,
             "state: reverted, image e2e-2",

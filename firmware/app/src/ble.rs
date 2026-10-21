@@ -1,4 +1,4 @@
-//! Passive BLE scanner sharing the radio with WiFi (esp-radio coexistence).
+//! BLE scanner sharing the radio with WiFi (esp-radio coexistence).
 //!
 //! Talks HCI to the controller directly through bt-hci: no host stack is
 //! needed to listen to advertisements.
@@ -40,8 +40,10 @@ async fn start_scan(hci: &Hci) -> Result<(), &'static str> {
     ))
     .await
     .map_err(|_| "set LE event mask failed")?;
+    // Active scanning: some sensors (ThermoPro) only send their name, which
+    // identifies the payload format, in the scan response.
     hci.exec(&LeSetScanParams::new(
-        LeScanKind::Passive,
+        LeScanKind::Active,
         HciDuration::from_millis(SCAN_INTERVAL_MS),
         HciDuration::from_millis(SCAN_WINDOW_MS),
         AddrKind::PUBLIC,
@@ -72,7 +74,7 @@ pub async fn task(bt: esp_hal::peripherals::BT<'static>, dev: Handle) {
         match start_scan(&hci).await {
             Ok(()) => {
                 log::info!(
-                    "ble: passive scan started (heap used {} / free {})",
+                    "ble: scan started (heap used {} / free {})",
                     esp_alloc::HEAP.used(),
                     esp_alloc::HEAP.free()
                 );

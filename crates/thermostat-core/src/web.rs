@@ -79,9 +79,14 @@ pub async fn handle<S: Read + Write, P: Platform>(
                         Tenths(s.setpoint_dc as i32),
                     )?;
                     match st.temperature_dc {
-                        Some(t) => write!(w, ",\"temperature\":{}}}", Tenths(t as i32)),
-                        None => w.write_str(",\"temperature\":null}"),
+                        Some(t) => write!(w, ",\"temperature\":{}", Tenths(t as i32))?,
+                        None => w.write_str(",\"temperature\":null")?,
                     }
+                    write!(
+                        w,
+                        ",\"sensors_used\":{},\"heating\":{},\"heating_reason\":\"{}\"}}",
+                        st.sensors_used, st.heating, st.heating_reason
+                    )
                 })
                 .await
         }
@@ -163,8 +168,10 @@ pub async fn handle<S: Read + Write, P: Platform>(
         }
         (Method::Get, "/settings") => {
             let s = p.settings();
+            let now = p.now_ms();
+            let found = sensor_candidates(p);
             page(sock, page_buf, "Settings", true, |w| {
-                settings_form(w, &s, None)
+                settings_form(w, &s, None, &found, now)
             })
             .await
         }
@@ -181,8 +188,10 @@ pub async fn handle<S: Read + Write, P: Platform>(
                 },
                 Err(msg) => (Notice::Err(msg), p.settings()),
             };
+            let now = p.now_ms();
+            let found = sensor_candidates(p);
             page(sock, page_buf, "Settings", true, |w| {
-                settings_form(w, &s, Some(msg))
+                settings_form(w, &s, Some(msg), &found, now)
             })
             .await
         }
@@ -356,6 +365,15 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
         return Err("Hysteresis must be between 0.1 and 5.0 °C.");
     }
     s.hysteresis_dc = hyst as u16;
+
+    s.temp_sensors.clear();
+    for raw in http::form_values(form, "sensor") {
+        let text: String<24> = http::url_decode(raw).ok_or("Invalid sensor address.")?;
+        let addr = crate::ble::parse_addr(&text).ok_or("Invalid sensor address.")?;
+        if !s.temp_sensors.contains(&addr) && s.temp_sensors.push(addr).is_err() {
+            return Err("Select at most 4 temperature sensors.");
+        }
+    }
 
     let new_pass = field("new_password")?;
     if !new_pass.is_empty() {
@@ -590,16 +608,106 @@ fn status_page(
         Tenths(s.setpoint_dc as i32),
     )?;
     match st.temperature_dc {
-        Some(t) => write!(w, "{} °C", Tenths(t as i32))?,
-        None => w.write_str("no sensor")?,
+        Some(t) => write!(
+            w,
+            "{} °C <small>({} sensor{})</small>",
+            Tenths(t as i32),
+            st.sensors_used,
+            if st.sensors_used == 1 { "" } else { "s" }
+        )?,
+        None if s.temp_sensors.is_empty() => w.write_str("no sensors selected (see Settings)")?,
+        None => w.write_str("no fresh reading from the selected sensors")?,
     }
+    write!(
+        w,
+        "</td></tr><tr><td>Heating</td><td><b>{}</b> <small>({})</small></td></tr>",
+        if st.heating { "ON" } else { "off" },
+        st.heating_reason
+    )?;
     w.write_str(
-        "</td></tr></table><form method=post action=/api/reboot onsubmit=\"return confirm('Reboot now?')\">\
+        "</table><form method=post action=/api/reboot onsubmit=\"return confirm('Reboot now?')\">\
 <button>Reboot</button></form>",
     )
 }
 
-fn settings_form(w: &mut BufWriter<'_>, s: &Settings, n: Option<Notice>) -> core::fmt::Result {
+/// Nearby devices that report a temperature: candidates for the thermostat.
+type Candidates = heapless::Vec<crate::ble::BleDevice, { crate::ble::MAX_DEVICES }>;
+
+fn sensor_candidates<P: Platform>(p: &mut P) -> Candidates {
+    p.ble(|t| {
+        let mut v = Candidates::new();
+        if let Some(t) = t {
+            for d in t.sorted() {
+                if d.sensor.is_some_and(|r| r.temperature_cc.is_some()) {
+                    let _ = v.push(d);
+                }
+            }
+        }
+        v
+    })
+}
+
+fn sensor_fieldset(
+    w: &mut BufWriter<'_>,
+    s: &Settings,
+    found: &Candidates,
+    now: u64,
+) -> core::fmt::Result {
+    write!(
+        w,
+        "<fieldset><legend>Temperature sensors</legend><p><small>The thermostat uses the average of the \
+checked sensors' readings (at most {}). Readings older than {} minutes are ignored; with none, heating stays off.</small></p>",
+        crate::settings::MAX_TEMP_SENSORS,
+        crate::control::READING_MAX_AGE_MS / 60_000
+    )?;
+    let mut any = false;
+    for d in found {
+        any = true;
+        let checked = if s.temp_sensors.contains(&d.addr) {
+            " checked"
+        } else {
+            ""
+        };
+        write!(
+            w,
+            "<label><input type=checkbox name=sensor value={}{checked} style=width:auto> {} <code>{}</code> · ",
+            d.addr_string(),
+            Escape(d.name.as_deref().unwrap_or("")),
+            d.addr_string()
+        )?;
+        if let Some(r) = &d.sensor {
+            sensor_text(w, r)?;
+        }
+        write!(
+            w,
+            " · {} dBm · {} s ago</label>",
+            d.rssi,
+            now.saturating_sub(d.sensor_ms) / 1000
+        )?;
+    }
+    for a in &s.temp_sensors {
+        if !found.iter().any(|d| &d.addr == a) {
+            any = true;
+            let addr = crate::ble::format_addr(a);
+            write!(
+                w,
+                "<label><input type=checkbox name=sensor value={addr} checked style=width:auto> <code>{addr}</code> · not heard recently</label>"
+            )?;
+        }
+    }
+    if !any {
+        w.write_str("<p>No temperature sensors heard yet. Supported: ThermoPro TP35x/TP39x, pvvx/ATC firmware, BTHome v2.</p>")?;
+    }
+    w.write_str("</fieldset>")
+}
+
+fn settings_form(
+    w: &mut BufWriter<'_>,
+    s: &Settings,
+    n: Option<Notice>,
+    found: &Candidates,
+    now: u64,
+) -> core::fmt::Result {
     notice(w, n)?;
     write!(
         w,
@@ -610,10 +718,7 @@ fn settings_form(w: &mut BufWriter<'_>, s: &Settings, n: Option<Notice>) -> core
 </fieldset><fieldset><legend>Thermostat</legend>\
 <label>Setpoint (°C)<input name=setpoint value=\"{}\" inputmode=decimal></label>\
 <label>Hysteresis (°C)<input name=hysteresis value=\"{}\" inputmode=decimal></label>\
-</fieldset><fieldset><legend>Admin password</legend>\
-<label>New password (leave empty to keep)<input type=password name=new_password minlength=8 autocomplete=new-password></label>\
-<label>Repeat new password<input type=password name=new_password2 autocomplete=new-password></label>\
-</fieldset><button>Save</button></form>",
+</fieldset>",
         Escape(&s.hostname),
         Escape(&s.wifi_ssid),
         if s.wifi_psk.is_some() {
@@ -623,6 +728,13 @@ fn settings_form(w: &mut BufWriter<'_>, s: &Settings, n: Option<Notice>) -> core
         },
         Tenths(s.setpoint_dc as i32),
         Tenths(s.hysteresis_dc as i32),
+    )?;
+    sensor_fieldset(w, s, found, now)?;
+    w.write_str(
+        "<fieldset><legend>Admin password</legend>\
+<label>New password (leave empty to keep)<input type=password name=new_password minlength=8 autocomplete=new-password></label>\
+<label>Repeat new password<input type=password name=new_password2 autocomplete=new-password></label>\
+</fieldset><button>Save</button></form>",
     )
 }
 
@@ -864,6 +976,9 @@ mod tests {
                 uptime_s: 5,
                 network: String::try_from("qemu 10.0.2.15").unwrap(),
                 temperature_dc: None,
+                sensors_used: 0,
+                heating: false,
+                heating_reason: "no sensor reading",
             }
         }
         fn request_reboot(&mut self) {
@@ -1181,5 +1296,94 @@ mod tests {
             html.len()
         );
         assert!(get(&mut p, "/api/ble", &cookie).text().ends_with("]}"));
+    }
+
+    #[test]
+    fn select_temperature_sensors() {
+        let (mut p, cookie) = provisioned();
+        let mut t = crate::ble::BleTable::new();
+        let tp = [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA];
+        t.observe(
+            tp,
+            0,
+            -60,
+            &[
+                13, 0x09, b'T', b'P', b'3', b'5', b'7', b' ', b'(', b'2', b'1', b'4', b'2', b')',
+            ],
+            0,
+        );
+        t.observe(
+            tp,
+            0,
+            -60,
+            &[7, 0xFF, 0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C],
+            1000,
+        );
+        t.observe([1; 6], 1, -40, &[4, 0xFF, 0x4C, 0x00, 0x10], 1000); // no reading: not a candidate
+        p.ble = Some(t);
+
+        let html = get(&mut p, "/settings", &cookie).text();
+        assert!(
+            html.contains("name=sensor value=AA:BB:CC:DD:EE:FF style"),
+            "{html}"
+        );
+        assert!(html.contains("TP357 (2142)") && html.contains("24.1 °C"));
+        assert!(!html.contains("01:01:01:01:01:01"));
+
+        let base = "hostname=t&ssid=&setpoint=20.0&hysteresis=0.5";
+        let form = std::format!("{base}&sensor=AA%3ABB%3ACC%3ADD%3AEE%3AFF");
+        assert!(
+            post(&mut p, "/settings", &cookie, form.as_bytes())
+                .text()
+                .contains("Saved")
+        );
+        assert_eq!(p.settings.temp_sensors.as_slice(), &[tp]);
+        let html = get(&mut p, "/settings", &cookie).text();
+        assert!(html.contains("value=AA:BB:CC:DD:EE:FF checked"));
+
+        // A selected sensor that is out of range stays listed (and selected).
+        p.ble = Some(crate::ble::BleTable::new());
+        assert!(
+            get(&mut p, "/settings", &cookie)
+                .text()
+                .contains("not heard recently")
+        );
+
+        let five: std::string::String = (1..=5)
+            .map(|i| std::format!("&sensor=0{i}%3A00%3A00%3A00%3A00%3A00"))
+            .collect();
+        let r = post(
+            &mut p,
+            "/settings",
+            &cookie,
+            std::format!("{base}{five}").as_bytes(),
+        );
+        assert!(r.text().contains("at most 4"));
+        assert!(
+            post(
+                &mut p,
+                "/settings",
+                &cookie,
+                std::format!("{base}&sensor=junk").as_bytes()
+            )
+            .text()
+            .contains("Invalid sensor address")
+        );
+        assert_eq!(
+            p.settings.temp_sensors.as_slice(),
+            &[tp],
+            "rejected forms change nothing"
+        );
+        // Unchecking everything clears the selection.
+        post(&mut p, "/settings", &cookie, base.as_bytes());
+        assert!(p.settings.temp_sensors.is_empty());
+
+        let status = get(&mut p, "/", &cookie).text();
+        assert!(status.contains("no sensors selected") && status.contains("Heating"));
+        let json = get(&mut p, "/api/status", "").text();
+        assert!(
+            json.contains("\"heating\":false") && json.contains("\"sensors_used\":0"),
+            "{json}"
+        );
     }
 }
