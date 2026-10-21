@@ -36,6 +36,11 @@ pub struct Settings {
     pub min_switch_min: u16,
     /// BLE sensors (addresses in on-air byte order) whose readings drive the thermostat.
     pub temp_sensors: Vec<[u8; 6], MAX_TEMP_SENSORS>,
+    /// Heater group: thermostats with the same id share one heater and its
+    /// short-cycle protection. Empty = this thermostat has its own heater.
+    pub heater_id: Str32,
+    /// Shared secret signing zone messages within the group (empty = unsigned).
+    pub group_key: Str32,
     /// NTP server, `host[:port]`.
     pub ntp_server: Str48,
     /// POSIX TZ string, e.g. `GMT0BST,M3.5.0/1,M10.5.0` (see `clock::TimeZone`).
@@ -68,6 +73,8 @@ impl Default for Settings {
             hysteresis_dc: 5,
             min_switch_min: crate::control::DEFAULT_MIN_SWITCH_MIN,
             temp_sensors: Vec::new(),
+            heater_id: String::new(),
+            group_key: String::new(),
             ntp_server: str48("pool.ntp.org"),
             timezone: str48("UTC0"),
         }
@@ -102,6 +109,8 @@ mod tag {
     pub const NTP_SERVER: u8 = 9;
     pub const TIMEZONE: u8 = 10;
     pub const MIN_SWITCH: u8 = 11;
+    pub const HEATER_ID: u8 = 12;
+    pub const GROUP_KEY: u8 = 13;
 }
 
 struct Writer<'a> {
@@ -135,6 +144,12 @@ impl Settings {
         w.field(tag::SETPOINT, &self.setpoint_dc.to_le_bytes());
         w.field(tag::HYSTERESIS, &self.hysteresis_dc.to_le_bytes());
         w.field(tag::MIN_SWITCH, &self.min_switch_min.to_le_bytes());
+        if !self.heater_id.is_empty() {
+            w.field(tag::HEATER_ID, self.heater_id.as_bytes());
+        }
+        if !self.group_key.is_empty() {
+            w.field(tag::GROUP_KEY, self.group_key.as_bytes());
+        }
         w.field(tag::NTP_SERVER, self.ntp_server.as_bytes());
         w.field(tag::TIMEZONE, self.timezone.as_bytes());
         if !self.temp_sensors.is_empty() {
@@ -189,6 +204,8 @@ impl Settings {
                     s.min_switch_min =
                         u16::from_le_bytes(v.try_into().map_err(|_| DecodeError::BadValue)?)
                 }
+                tag::HEATER_ID => s.heater_id = text()?,
+                tag::GROUP_KEY => s.group_key = text()?,
                 tag::NTP_SERVER => s.ntp_server = text48()?,
                 tag::TIMEZONE => s.timezone = text48()?,
                 tag::TEMP_SENSORS => {
@@ -234,6 +251,8 @@ mod tests {
             temp_sensors: Vec::from_slice(&[[1, 2, 3, 4, 5, 6], [9; 6]]).unwrap(),
             ntp_server: str48("10.0.2.2:12345"),
             min_switch_min: 90,
+            heater_id: str32("boiler"),
+            group_key: str32("secret"),
             timezone: str48("GMT0BST,M3.5.0/1,M10.5.0"),
             ..Settings::default()
         };
@@ -263,6 +282,8 @@ mod tests {
             admin_user: str32(&"u".repeat(40)),
             temp_sensors: Vec::from_slice(&[[0xAA; 6]; MAX_TEMP_SENSORS]).unwrap(),
             ntp_server: str48(&"n".repeat(48)),
+            heater_id: str32(&"h".repeat(32)),
+            group_key: str32(&"k".repeat(32)),
             timezone: str48(&"t".repeat(48)),
             wifi_psk: Some([0; 32]),
             admin_hash: Some(PasswordHash {

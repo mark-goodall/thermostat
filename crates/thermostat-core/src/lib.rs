@@ -18,5 +18,6 @@ pub mod settings;
 pub mod sntp;
 pub mod store;
 pub mod web;
+pub mod zones;
 
 pub use codec::hex;

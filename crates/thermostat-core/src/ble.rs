@@ -401,6 +401,18 @@ impl BleTable {
         }
     }
 
+    /// Insert a reading directly (emulator test hook; no radio there).
+    pub fn inject(&mut self, addr: [u8; 6], temperature_cc: i16, now_ms: u64) {
+        // A pvvx frame carrying the reading goes through the normal path.
+        let mut frame = [0u8; 19];
+        frame[..4].copy_from_slice(&[18, 0x16, 0x1A, 0x18]);
+        frame[4..10].copy_from_slice(&addr);
+        frame[10..12].copy_from_slice(&temperature_cc.to_le_bytes());
+        frame[12..14].copy_from_slice(&5000u16.to_le_bytes());
+        frame[14..19].copy_from_slice(&[0x86, 0x0B, 100, 0, 0]);
+        self.observe(addr, 0, -40, &frame, now_ms);
+    }
+
     pub fn get(&self, addr: &[u8; 6]) -> Option<&BleDevice> {
         self.devices.iter().find(|d| &d.addr == addr)
     }

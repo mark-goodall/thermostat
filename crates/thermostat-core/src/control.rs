@@ -69,9 +69,28 @@ pub enum Reason {
     Holding,
 }
 
+/// The rest of the heater group, as seen by this zone (see `zones`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GroupState {
+    /// Another zone currently requests heat, so the heater runs regardless of us.
+    pub others_heating: bool,
+    /// Latest heater transition reported by the group, in our monotonic ms.
+    pub last_heater_switch_ms: Option<u64>,
+}
+
+impl GroupState {
+    /// A thermostat with its own heater.
+    pub const STANDALONE: GroupState = GroupState {
+        others_heating: false,
+        last_heater_switch_ms: None,
+    };
+}
+
 pub struct Thermostat {
     heating: bool,
+    /// When this zone last switched the heater itself (monotonic ms).
     last_switch_ms: Option<u64>,
+    heater_switched: bool,
     /// While holding: when the pending switch becomes allowed.
     hold_until_ms: Option<u64>,
     pub reason: Reason,
@@ -88,6 +107,7 @@ impl Thermostat {
         Self {
             heating: false,
             last_switch_ms: None,
+            heater_switched: false,
             hold_until_ms: None,
             reason: Reason::NoReading,
         }
@@ -95,6 +115,12 @@ impl Thermostat {
 
     pub fn heating(&self) -> bool {
         self.heating
+    }
+
+    /// True once after an update in which this zone switched the heater on or
+    /// off (the group should learn the new transition time).
+    pub fn take_heater_switch(&mut self) -> bool {
+        core::mem::take(&mut self.heater_switched)
     }
 
     /// Milliseconds until a pending (held back) switch is allowed.
@@ -107,21 +133,27 @@ impl Thermostat {
 
     /// Decide whether to heat. Heating turns on at or below
     /// `setpoint - hysteresis/2` and off at or above `setpoint + hysteresis/2`
-    /// (tenths of °C). Switches are at least `min_switch_ms` apart, except
-    /// that losing all readings switches off at once.
+    /// (tenths of °C).
+    ///
+    /// Short-cycle protection applies to heater transitions: switching while
+    /// another zone keeps the heater running is immediate; switching the heater
+    /// itself on or off waits until `min_switch_ms` after the latest heater
+    /// transition (ours or the group's). Losing all readings switches off at once.
     pub fn update(
         &mut self,
         room: Option<RoomTemperature>,
         setpoint_dc: i16,
         hysteresis_dc: u16,
         min_switch_ms: u64,
+        group: GroupState,
         now_ms: u64,
     ) -> bool {
         self.hold_until_ms = None;
+        let heater_transition = !group.others_heating;
         let Some(room) = room else {
             self.reason = Reason::NoReading;
             if self.heating {
-                self.switch(false, now_ms);
+                self.switch(false, heater_transition, now_ms);
             }
             return self.heating;
         };
@@ -137,20 +169,24 @@ impl Thermostat {
         };
         self.reason = reason;
         if want != self.heating {
-            match self.last_switch_ms {
-                Some(last) if now_ms.saturating_sub(last) < min_switch_ms => {
+            let last = self.last_switch_ms.max(group.last_heater_switch_ms);
+            match last {
+                Some(last) if heater_transition && now_ms.saturating_sub(last) < min_switch_ms => {
                     self.reason = Reason::Holding;
                     self.hold_until_ms = Some(last + min_switch_ms);
                 }
-                _ => self.switch(want, now_ms),
+                _ => self.switch(want, heater_transition, now_ms),
             }
         }
         self.heating
     }
 
-    fn switch(&mut self, on: bool, now_ms: u64) {
+    fn switch(&mut self, on: bool, heater_transition: bool, now_ms: u64) {
         self.heating = on;
-        self.last_switch_ms = Some(now_ms);
+        if heater_transition {
+            self.last_switch_ms = Some(now_ms);
+            self.heater_switched = true;
+        }
     }
 }
 
@@ -225,26 +261,40 @@ mod tests {
     fn hysteresis_band() {
         let mut th = Thermostat::new();
         // Setpoint 20.0, hysteresis 1.0: on at <= 19.5, off at >= 20.5.
-        assert!(!th.update(room(1960), 200, 10, MIN, 0));
+        assert!(!th.update(room(1960), 200, 10, MIN, GroupState::STANDALONE, 0));
         assert_eq!(th.reason, Reason::InBand);
-        assert!(th.update(room(1950), 200, 10, MIN, 0));
+        assert!(th.update(room(1950), 200, 10, MIN, GroupState::STANDALONE, 0));
         assert!(
-            th.update(room(2040), 200, 10, MIN, 10 * 60_000),
+            th.update(
+                room(2040),
+                200,
+                10,
+                MIN,
+                GroupState::STANDALONE,
+                10 * 60_000
+            ),
             "stays on inside the band"
         );
-        assert!(!th.update(room(2050), 200, 10, MIN, 20 * 60_000));
+        assert!(!th.update(
+            room(2050),
+            200,
+            10,
+            MIN,
+            GroupState::STANDALONE,
+            20 * 60_000
+        ));
         assert_eq!(th.reason, Reason::AboveBand);
     }
 
     #[test]
     fn minimum_switch_interval() {
         let mut th = Thermostat::new();
-        assert!(th.update(room(1800), 200, 10, MIN, 0));
+        assert!(th.update(room(1800), 200, 10, MIN, GroupState::STANDALONE, 0));
         // Overshoot right away: holds until the interval passes.
-        assert!(th.update(room(2200), 200, 10, MIN, 30_000));
+        assert!(th.update(room(2200), 200, 10, MIN, GroupState::STANDALONE, 30_000));
         assert_eq!(th.reason, Reason::Holding);
         assert_eq!(th.hold_remaining_ms(30_000), Some(MIN - 30_000));
-        assert!(!th.update(room(2200), 200, 10, MIN, MIN));
+        assert!(!th.update(room(2200), 200, 10, MIN, GroupState::STANDALONE, MIN));
         assert_eq!(th.hold_remaining_ms(MIN), None);
     }
 
@@ -253,23 +303,69 @@ mod tests {
         let four_h = DEFAULT_MIN_SWITCH_MIN as u64 * 60_000;
         let mut th = Thermostat::new();
         assert!(
-            th.update(room(1800), 200, 10, four_h, 0),
+            th.update(room(1800), 200, 10, four_h, GroupState::STANDALONE, 0),
             "first switch is immediate"
         );
-        assert!(th.update(room(2200), 200, 10, four_h, 3 * 3_600_000));
+        assert!(th.update(
+            room(2200),
+            200,
+            10,
+            four_h,
+            GroupState::STANDALONE,
+            3 * 3_600_000
+        ));
         assert_eq!(th.hold_remaining_ms(3 * 3_600_000), Some(3_600_000));
-        assert!(!th.update(room(2200), 200, 10, four_h, four_h));
+        assert!(!th.update(room(2200), 200, 10, four_h, GroupState::STANDALONE, four_h));
         // Zero disables the protection.
-        assert!(th.update(room(1800), 200, 10, 0, four_h + 1));
+        assert!(th.update(room(1800), 200, 10, 0, GroupState::STANDALONE, four_h + 1));
+    }
+
+    #[test]
+    fn shared_heater_protection() {
+        let busy = GroupState {
+            others_heating: true,
+            last_heater_switch_ms: Some(0),
+        };
+        let idle_recent = GroupState {
+            others_heating: false,
+            last_heater_switch_ms: Some(0),
+        };
+        let mut th = Thermostat::new();
+        // Another zone already runs the heater: joining is immediate and is not
+        // a heater transition.
+        assert!(th.update(room(1800), 200, 10, MIN, busy, 1_000));
+        assert!(!th.take_heater_switch());
+        // Leaving while the other zone keeps heating is immediate too.
+        assert!(!th.update(room(2200), 200, 10, MIN, busy, 2_000));
+        // The heater stopped recently (switched off by the group at t=0):
+        // being the first zone to want heat again has to wait.
+        assert!(!th.update(room(1800), 200, 10, MIN, idle_recent, 3_000));
+        assert_eq!(th.reason, Reason::Holding);
+        assert_eq!(th.hold_remaining_ms(3_000), Some(MIN - 3_000));
+        assert!(th.update(room(1800), 200, 10, MIN, idle_recent, MIN));
+        assert!(th.take_heater_switch(), "this zone switched the heater on");
+        // Now the last zone on: switching off is a heater transition, held
+        // until the interval since our switch-on has passed.
+        assert!(th.update(
+            room(2200),
+            200,
+            10,
+            MIN,
+            GroupState::STANDALONE,
+            MIN + 1_000
+        ));
+        assert_eq!(th.reason, Reason::Holding);
+        assert!(!th.update(room(2200), 200, 10, MIN, GroupState::STANDALONE, 2 * MIN));
+        assert!(th.take_heater_switch());
     }
 
     #[test]
     fn fails_safe_without_readings() {
         let mut th = Thermostat::new();
-        assert!(th.update(room(1800), 200, 10, MIN, 0));
+        assert!(th.update(room(1800), 200, 10, MIN, GroupState::STANDALONE, 0));
         // Losing the sensor switches off immediately, despite the interval.
-        assert!(!th.update(None, 200, 10, MIN, 1_000));
+        assert!(!th.update(None, 200, 10, MIN, GroupState::STANDALONE, 1_000));
         assert_eq!(th.reason, Reason::NoReading);
-        assert!(!th.update(None, 200, 10, MIN, 10 * 60_000));
+        assert!(!th.update(None, 200, 10, MIN, GroupState::STANDALONE, 10 * 60_000));
     }
 }

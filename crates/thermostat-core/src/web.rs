@@ -12,6 +12,9 @@
 //! | `POST /api/reboot` | yes   |                                           |
 //! | `GET  /api/status` | –     | JSON status                               |
 //! | `GET  /ble`        | yes   | nearby BLE advertisers (auto-refreshing)  |
+//! | `GET  /api/zone`   | –     | this zone and its heater group (JSON)     |
+//! | `POST /api/zone/event` | group key | a peer zone's state; replies with ours |
+//! | `POST /api/test/sensor` | yes | emulator builds: inject a sensor reading |
 //! | `GET  /api/ble`    | yes   | the same as JSON                          |
 //!
 //! "auth" accepts a session cookie or HTTP Basic credentials (for scripts).
@@ -105,6 +108,51 @@ pub async fn handle<S: Read + Write, P: Platform>(
                 })
                 .await
         }
+        (Method::Get, "/api/zone") => {
+            let now = p.now_ms();
+            let own = own_zone_message(p);
+            let snapshot = zone_snapshot(p, now);
+            respond(sock, page_buf, 200, "application/json", &[], |w| {
+                zone_json(w, own.as_ref(), &snapshot)
+            })
+            .await
+        }
+        (Method::Post, "/api/zone/event") => {
+            let mut form = [0u8; MAX_FORM];
+            let body = read_form(sock, &req, body_prefix, &mut form).await?;
+            let s = p.settings();
+            let now_unix = p.status().unix_time;
+            match crate::zones::ZoneMessage::decode(
+                body,
+                &s.heater_id,
+                &s.hostname,
+                &s.group_key,
+                now_unix,
+            ) {
+                Ok(msg) => {
+                    let now = p.now_ms();
+                    p.zones(|g| g.receive(&msg, now));
+                    // Reply with our own state so the sender learns it right away.
+                    let reply = own_zone_message(p)
+                        .map(|m| m.encode(&s.group_key))
+                        .unwrap_or_default();
+                    respond(sock, page_buf, 200, "text/plain", &[], |w| {
+                        w.write_str(&reply)
+                    })
+                    .await
+                }
+                Err(e) => {
+                    p.zones(|g| g.rejected += 1);
+                    let status = match e {
+                        crate::zones::ZoneError::BadSignature | crate::zones::ZoneError::Stale => {
+                            403
+                        }
+                        _ => 400,
+                    };
+                    error(sock, page_buf, status, e.as_str()).await
+                }
+            }
+        }
         (_, "/setup") if p.settings().is_provisioned() => redirect(sock, page_buf, "/", None).await,
         (Method::Get, "/setup") => {
             page(sock, page_buf, "Setup", false, |w| setup_form(w, None)).await
@@ -176,8 +224,10 @@ pub async fn handle<S: Read + Write, P: Platform>(
             let st = p.status();
             let s = p.settings();
             let version: Str32 = crate::settings::str32(p.running_version());
+            let now = p.now_ms();
+            let zone = (!s.heater_id.is_empty()).then(|| zone_snapshot(p, now));
             page(sock, page_buf, "Status", true, |w| {
-                status_page(w, &s, &st, &version)
+                status_page(w, &s, &st, &version, zone.as_ref())
             })
             .await
         }
@@ -254,6 +304,33 @@ pub async fn handle<S: Read + Write, P: Platform>(
                     respond(sock, page_buf, 400, "application/json", &[], |w| {
                         write!(w, "{{\"ok\":false,\"error\":\"{}\"}}", msg)
                     })
+                    .await
+                }
+            }
+        }
+        (Method::Post, "/api/test/sensor") => {
+            let mut form = [0u8; MAX_FORM];
+            let form = read_form(sock, &req, body_prefix, &mut form).await?;
+            let addr =
+                http::form_field::<24>(form, "addr").and_then(|a| crate::ble::parse_addr(&a));
+            let temp = http::form_field::<8>(form, "temp").and_then(|t| http::parse_tenths(&t));
+            match (addr, temp) {
+                (Some(addr), Some(t)) if p.inject_reading(addr, (t * 10) as i16) => {
+                    respond(sock, page_buf, 200, "text/plain", &[], |w| {
+                        w.write_str("ok")
+                    })
+                    .await
+                }
+                (Some(_), Some(_)) => {
+                    error(sock, page_buf, 404, "not supported in this build").await
+                }
+                _ => {
+                    error(
+                        sock,
+                        page_buf,
+                        400,
+                        "need addr=AA:BB:CC:DD:EE:FF and temp=21.5",
+                    )
                     .await
                 }
             }
@@ -382,6 +459,27 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
     s.hysteresis_dc = hyst as u16;
 
     // Older forms (and scripts) may omit these fields: keep the stored values.
+    if let Some(raw) = http::form_value(form, "heater_id") {
+        let id: Str32 = http::url_decode(raw).ok_or("Heater id is too long.")?;
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err("Heater id: letters, digits, '-' and '_' only.");
+        }
+        s.heater_id = id;
+    }
+    if http::form_value(form, "clear_group_key").is_some() {
+        s.group_key.clear();
+    } else if let Some(raw) = http::form_value(form, "group_key") {
+        let key: Str32 = http::url_decode(raw).ok_or("Group key is too long.")?;
+        if !key.is_empty() {
+            if key.len() < 8 {
+                return Err("Group key must be at least 8 characters.");
+            }
+            s.group_key = key;
+        }
+    }
     if let Some(raw) = http::form_value(form, "min_switch") {
         let v: String<8> = http::url_decode(raw).ok_or("Invalid minimum switch time.")?;
         s.min_switch_min = v
@@ -633,6 +731,7 @@ fn status_page(
     s: &Settings,
     st: &crate::platform::DeviceStatus,
     version: &str,
+    zone: Option<&ZoneSnapshot>,
 ) -> core::fmt::Result {
     write!(
         w,
@@ -666,7 +765,32 @@ fn status_page(
         let m = r.div_ceil(60);
         write!(w, ", {} h {:02} min left", m / 60, m % 60)?;
     }
-    w.write_str(")</small></td></tr><tr><td>Time</td><td>")?;
+    w.write_str(")</small></td></tr>")?;
+    if let Some(z) = zone {
+        write!(
+            w,
+            "<tr><td>Heater group</td><td><code>{}</code>: ",
+            Escape(&s.heater_id)
+        )?;
+        if z.peers.is_empty() {
+            w.write_str("no other zones found yet")?;
+        }
+        for (i, (name, _, heat, _, active)) in z.peers.iter().enumerate() {
+            let state = match (active, heat) {
+                (false, _) => "silent",
+                (true, true) => "heating",
+                (true, false) => "idle",
+            };
+            write!(
+                w,
+                "{}{} ({state})",
+                if i > 0 { ", " } else { "" },
+                Escape(name)
+            )?;
+        }
+        w.write_str("</td></tr>")?;
+    }
+    w.write_str("<tr><td>Time</td><td>")?;
     match (st.unix_time, st.time_synced_ago_s) {
         (Some(t), Some(ago)) => {
             let tz =
@@ -794,7 +918,13 @@ fn settings_form(
 </fieldset><fieldset><legend>Time</legend>\
 <label>NTP server (host or host:port)<input name=ntp_server value=\"{}\" maxlength=48 required></label>\
 <label>Timezone (POSIX TZ, e.g. GMT0BST,M3.5.0/1,M10.5.0 · CET-1CEST,M3.5.0,M10.5.0/3 · EST5EDT,M3.2.0,M11.1.0 · UTC0)\
-<input name=timezone value=\"{}\" maxlength=48 required></label></fieldset>",
+<input name=timezone value=\"{}\" maxlength=48 required></label></fieldset>\
+<fieldset><legend>Heater group</legend><p><small>Thermostats with the same heater id share one heater: \
+it runs while any zone requests heat, and the short-cycle protection applies to the heater as a whole. \
+Leave empty if this thermostat has its own heater.</small></p>\
+<label>Heater id<input name=heater_id value=\"{}\" maxlength=32></label>\
+<label>Group key (same on every zone; signs zone messages){}<input type=password name=group_key maxlength=32 autocomplete=new-password></label>\
+{}</fieldset>",
         Escape(&s.hostname),
         Escape(&s.wifi_ssid),
         if s.wifi_psk.is_some() {
@@ -807,6 +937,17 @@ fn settings_form(
         s.min_switch_min,
         Escape(&s.ntp_server),
         Escape(&s.timezone),
+        Escape(&s.heater_id),
+        if s.group_key.is_empty() {
+            " — none set, messages are unsigned"
+        } else {
+            " — set; leave empty to keep"
+        },
+        if s.group_key.is_empty() {
+            ""
+        } else {
+            "<label><input type=checkbox name=clear_group_key style=width:auto> Remove the group key</label>"
+        },
     )?;
     sensor_fieldset(w, s, found, now)?;
     w.write_str(
@@ -815,6 +956,111 @@ fn settings_form(
 <label>Repeat new password<input type=password name=new_password2 autocomplete=new-password></label>\
 </fieldset><button>Save</button></form>",
     )
+}
+
+/// This zone's state as a group message (None when not in a heater group).
+fn own_zone_message<P: Platform>(p: &mut P) -> Option<crate::zones::ZoneMessage> {
+    let s = p.settings();
+    if s.heater_id.is_empty() {
+        return None;
+    }
+    let st = p.status();
+    let last_switch = p.zones(|g| g.last_switch);
+    Some(crate::zones::ZoneMessage {
+        heater: s.heater_id,
+        zone: s.hostname,
+        heat: st.heating,
+        last_switch,
+        ts: st.unix_time,
+    })
+}
+
+/// (zone, address, heating, seconds since heard, active)
+type ZonePeerRow = (
+    crate::zones::Name,
+    Option<([u8; 4], u16)>,
+    bool,
+    Option<u64>,
+    bool,
+);
+struct ZoneSnapshot {
+    peers: heapless::Vec<ZonePeerRow, { crate::zones::MAX_PEERS }>,
+    last_switch: Option<i64>,
+    rejected: u32,
+}
+
+fn zone_snapshot<P: Platform>(p: &mut P, now: u64) -> ZoneSnapshot {
+    p.zones(|g| {
+        let mut peers = heapless::Vec::new();
+        for peer in g.peers() {
+            let _ = peers.push((
+                peer.zone.clone(),
+                peer.addr,
+                peer.heat,
+                peer.heard_ms.map(|t| now.saturating_sub(t) / 1000),
+                g.is_fresh(peer, now),
+            ));
+        }
+        ZoneSnapshot {
+            peers,
+            last_switch: g.last_switch,
+            rejected: g.rejected,
+        }
+    })
+}
+
+fn json_str(w: &mut BufWriter<'_>, s: &str) -> core::fmt::Result {
+    w.write_char('"')?;
+    for c in s.chars() {
+        match c {
+            '"' => w.write_str("\\\"")?,
+            '\\' => w.write_str("\\\\")?,
+            c if c.is_control() => {}
+            c => w.write_char(c)?,
+        }
+    }
+    w.write_char('"')
+}
+
+fn zone_json(
+    w: &mut BufWriter<'_>,
+    own: Option<&crate::zones::ZoneMessage>,
+    z: &ZoneSnapshot,
+) -> core::fmt::Result {
+    let Some(own) = own else {
+        return w.write_str("{\"heater\":null}");
+    };
+    w.write_str("{\"heater\":")?;
+    json_str(w, &own.heater)?;
+    w.write_str(",\"zone\":")?;
+    json_str(w, &own.zone)?;
+    write!(w, ",\"heat\":{},\"last_switch\":", own.heat)?;
+    match z.last_switch {
+        Some(t) => write!(w, "{t}")?,
+        None => w.write_str("null")?,
+    }
+    write!(w, ",\"rejected\":{},\"peers\":[", z.rejected)?;
+    for (i, (zone, addr, heat, age, active)) in z.peers.iter().enumerate() {
+        if i > 0 {
+            w.write_char(',')?;
+        }
+        w.write_str("{\"zone\":")?;
+        json_str(w, zone)?;
+        match addr {
+            Some((a, port)) => write!(
+                w,
+                ",\"addr\":\"{}.{}.{}.{}:{port}\"",
+                a[0], a[1], a[2], a[3]
+            )?,
+            None => w.write_str(",\"addr\":null")?,
+        }
+        write!(w, ",\"heat\":{heat},\"active\":{active},\"age_s\":")?;
+        match age {
+            Some(a) => write!(w, "{a}}}")?,
+            None => w.write_str("null}")?,
+        }
+    }
+    w.write_str("]}")
 }
 
 type BleSnapshot = (
@@ -1018,6 +1264,8 @@ mod tests {
         ble: Option<crate::ble::BleTable>,
         time: Option<i64>,
         hold: Option<u64>,
+        group: crate::zones::Group,
+        injected: Option<([u8; 6], i16)>,
     }
 
     impl Ota for Fake {
@@ -1078,6 +1326,13 @@ mod tests {
         }
         fn ble<R>(&mut self, f: impl FnOnce(Option<&crate::ble::BleTable>) -> R) -> R {
             f(self.ble.as_ref())
+        }
+        fn zones<R>(&mut self, f: impl FnOnce(&mut crate::zones::Group) -> R) -> R {
+            f(&mut self.group)
+        }
+        fn inject_reading(&mut self, addr: [u8; 6], temperature_cc: i16) -> bool {
+            self.injected = Some((addr, temperature_cc));
+            true
         }
     }
 
@@ -1571,5 +1826,114 @@ mod tests {
             json.contains("\"min_switch_min\":90") && json.contains("\"hold_remaining_s\":4990"),
             "{json}"
         );
+    }
+
+    #[test]
+    fn heater_group_api() {
+        let (mut p, cookie) = provisioned();
+        assert_eq!(get(&mut p, "/api/zone", "").text(), "{\"heater\":null}");
+        let base = "hostname=bedroom&ssid=&setpoint=20.0&hysteresis=0.5";
+        let form = std::format!("{base}&heater_id=boiler&group_key=correct-horse");
+        assert!(
+            post(&mut p, "/settings", &cookie, form.as_bytes())
+                .text()
+                .contains("Saved")
+        );
+        assert_eq!(
+            (p.settings.heater_id.as_str(), p.settings.group_key.as_str()),
+            ("boiler", "correct-horse")
+        );
+        let html = get(&mut p, "/settings", &cookie).text();
+        assert!(
+            html.contains("name=heater_id value=\"boiler\"") && !html.contains("correct-horse")
+        );
+        // Empty key field keeps the key; the checkbox removes it.
+        post(
+            &mut p,
+            "/settings",
+            &cookie,
+            std::format!("{base}&heater_id=boiler&group_key=").as_bytes(),
+        );
+        assert_eq!(p.settings.group_key, "correct-horse");
+        assert!(
+            post(
+                &mut p,
+                "/settings",
+                &cookie,
+                std::format!("{base}&heater_id=bad%20id").as_bytes()
+            )
+            .text()
+            .contains("Heater id")
+        );
+        assert!(
+            post(
+                &mut p,
+                "/settings",
+                &cookie,
+                std::format!("{base}&heater_id=boiler&group_key=short").as_bytes()
+            )
+            .text()
+            .contains("at least 8")
+        );
+
+        // A signed event from the kitchen zone, no login needed.
+        p.time = Some(1_800_000_000);
+        let msg = crate::zones::ZoneMessage {
+            heater: crate::settings::str32("boiler"),
+            zone: crate::settings::str32("kitchen"),
+            heat: true,
+            last_switch: Some(1_799_990_000),
+            ts: Some(1_800_000_000),
+        };
+        let r = post(
+            &mut p,
+            "/api/zone/event",
+            "",
+            msg.encode("correct-horse").as_bytes(),
+        );
+        assert_eq!(r.status, 200, "{}", r.text());
+        // The reply is our own signed state.
+        let reply = crate::zones::ZoneMessage::decode(
+            &r.text(),
+            "boiler",
+            "kitchen",
+            "correct-horse",
+            Some(1_800_000_000),
+        )
+        .unwrap();
+        assert_eq!(
+            (reply.zone.as_str(), reply.heat, reply.last_switch),
+            ("bedroom", false, Some(1_799_990_000))
+        );
+        assert!(p.group.others_heating(1000));
+        assert_eq!(
+            post(
+                &mut p,
+                "/api/zone/event",
+                "",
+                msg.encode("wrong-key!").as_bytes()
+            )
+            .status,
+            403
+        );
+        assert_eq!(p.group.rejected, 1);
+
+        let json = get(&mut p, "/api/zone", "").text();
+        assert!(json.starts_with("{\"heater\":\"boiler\",\"zone\":\"bedroom\",\"heat\":false,\"last_switch\":1799990000,\"rejected\":1,\"peers\":[{\"zone\":\"kitchen\",\"addr\":null,\"heat\":true,\"active\":true"), "{json}");
+        assert!(
+            get(&mut p, "/", &cookie)
+                .text()
+                .contains("kitchen (heating)")
+        );
+
+        let r = post(
+            &mut p,
+            "/api/test/sensor",
+            &cookie,
+            b"addr=01%3A02%3A03%3A04%3A05%3A06&temp=19.5",
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(p.injected, Some(([6, 5, 4, 3, 2, 1], 1950)));
+        assert_eq!(post(&mut p, "/api/test/sensor", "", b"addr=x").status, 401);
     }
 }

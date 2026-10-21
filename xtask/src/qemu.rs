@@ -83,6 +83,6 @@ pub fn command(
     Ok(cmd)
 }
 
-pub fn run_tests(release: bool) -> Result<()> {
-    crate::e2e::run(release)
+pub fn run_tests(release: bool, zones_only: bool) -> Result<()> {
+    crate::e2e::run(release, zones_only)
 }

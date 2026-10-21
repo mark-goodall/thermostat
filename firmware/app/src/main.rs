@@ -18,6 +18,7 @@ mod net;
 mod serial;
 mod sntp;
 mod web;
+mod zones;
 
 use core::cell::RefCell;
 
@@ -133,6 +134,7 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(mdns::task(stack, dev).unwrap());
     spawner.spawn(sntp::task(stack, dev).unwrap());
+    spawner.spawn(zones::task(stack, dev).unwrap());
     // Heat demand, active high. GPIO2 drives the on-board LED on many ESP32
     // dev boards, so the state is visible until a relay driver is attached.
     let heat_output = esp_hal::gpio::Output::new(

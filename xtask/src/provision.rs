@@ -33,6 +33,15 @@ pub struct Args {
     /// Setpoint in °C, e.g. 20.5
     #[arg(long, default_value = "20.0")]
     setpoint: String,
+    /// Heater group id shared by zones on one heater.
+    #[arg(long, default_value = "")]
+    heater_id: String,
+    /// Group key (same on every zone of the group) signing zone messages.
+    #[arg(long, env = "THERMOSTAT_GROUP_KEY", default_value = "")]
+    group_key: String,
+    /// POSIX TZ string, e.g. GMT0BST,M3.5.0/1,M10.5.0
+    #[arg(long, default_value = "UTC0")]
+    timezone: String,
 }
 
 struct RamFlash(Vec<u8>);
@@ -72,7 +81,25 @@ impl NorFlash for RamFlash {
     }
 }
 
-fn random_salt() -> Result<[u8; 16]> {
+/// The settings partition contents holding `settings` (one record).
+pub fn settings_image(settings: &Settings) -> Result<Vec<u8>> {
+    let part = settings_partition();
+    let mut flash = RamFlash(vec![0xFF; part.size as usize]);
+    let (mut store, _) = SettingsStore::load(&mut flash).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    store
+        .save(&mut flash, settings)
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    Ok(flash.0)
+}
+
+pub fn settings_partition() -> embassy_boot_esp::partition::Partition {
+    layout::partitions()
+        .into_iter()
+        .find(|p| p.label() == "settings")
+        .unwrap()
+}
+
+pub fn random_salt() -> Result<[u8; 16]> {
     use std::io::Read;
     let mut salt = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut salt)?;
@@ -94,8 +121,16 @@ pub fn run(args: &Args) -> Result<()> {
             DEFAULT_ITERATIONS,
         )),
         setpoint_dc: setpoint as i16,
+        heater_id: str32(&args.heater_id),
+        group_key: str32(&args.group_key),
+        timezone: thermostat_core::settings::str48(&args.timezone),
         ..Settings::default()
     };
+    if !args.group_key.is_empty() && args.group_key.len() < 8 {
+        bail!("group key must be at least 8 characters");
+    }
+    thermostat_core::clock::TimeZone::parse(&args.timezone)
+        .map_err(|_| anyhow::anyhow!("invalid POSIX TZ string"))?;
     if let (Some(ssid), Some(pass)) = (&args.ssid, &args.wifi_password) {
         if !(8..=63).contains(&pass.len()) {
             bail!("WiFi password must be 8-63 characters");
@@ -104,19 +139,11 @@ pub fn run(args: &Args) -> Result<()> {
         settings.wifi_psk = Some(wpa_psk(pass, ssid));
     }
 
-    let part = layout::partitions()
-        .into_iter()
-        .find(|p| p.label() == "settings")
-        .unwrap();
-    let mut flash = RamFlash(vec![0xFF; part.size as usize]);
-    let (mut store, _) = SettingsStore::load(&mut flash).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    store
-        .save(&mut flash, &settings)
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
+    let image = settings_image(&settings)?;
+    let part = settings_partition();
     let out = crate::workspace_root().join("target/images/settings.bin");
     std::fs::create_dir_all(out.parent().unwrap())?;
-    std::fs::write(&out, &flash.0)?;
+    std::fs::write(&out, &image)?;
     eprintln!("settings image: {}", out.display());
 
     if let Some(port) = &args.port {

@@ -2704,6 +2704,7 @@ dependencies = [
  "clap",
  "embassy-boot-esp",
  "embedded-storage",
+ "heapless 0.9.3",
  "md-5",
  "object",
  "serde_json",

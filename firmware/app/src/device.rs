@@ -17,6 +17,7 @@ use thermostat_core::control::{RoomTemperature, Thermostat};
 use thermostat_core::platform::{BootState, DeviceStatus, Ota, OtaError, Platform};
 use thermostat_core::settings::Settings;
 use thermostat_core::store::{SettingsStore, StoreError};
+use thermostat_core::zones::Group;
 
 pub const VERSION: &str = match option_env!("THERMOSTAT_VERSION") {
     Some(v) => v,
@@ -47,6 +48,8 @@ pub struct Device {
     pub room: Option<RoomTemperature>,
     /// Wall-clock time, set by SNTP.
     pub clock: WallClock,
+    /// Other zones sharing this thermostat's heater.
+    pub group: Group,
     pub boot: BootState,
     pub network: String<48>,
     pub reboot_requested: bool,
@@ -77,6 +80,7 @@ impl Device {
             thermostat: Thermostat::new(),
             room: None,
             clock: WallClock::new(),
+            group: Group::new(),
             boot,
             network: String::try_from("starting").unwrap(),
             reboot_requested: false,
@@ -225,8 +229,19 @@ impl Platform for Handle {
         self.with(|d| f(&mut d.sessions))
     }
 
+    fn zones<R>(&mut self, f: impl FnOnce(&mut Group) -> R) -> R {
+        self.with(|d| f(&mut d.group))
+    }
+
+    #[cfg(feature = "qemu")]
+    fn inject_reading(&mut self, addr: [u8; 6], temperature_cc: i16) -> bool {
+        let now = Instant::now().as_millis();
+        self.with(|d| d.ble.inject(addr, temperature_cc, now));
+        true
+    }
+
     fn ble<R>(&mut self, f: impl FnOnce(Option<&BleTable>) -> R) -> R {
-        // The emulator has no Bluetooth radio.
-        self.with(|d| f(cfg!(feature = "wifi").then_some(&d.ble)))
+        // The emulator has no Bluetooth radio (only injected test readings).
+        self.with(|d| f(Some(&d.ble)))
     }
 }

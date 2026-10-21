@@ -77,6 +77,9 @@ enum Cmd {
     TestQemu {
         #[arg(long)]
         release: bool,
+        /// Only run the two-zone (shared heater) scenario.
+        #[arg(long)]
+        zones_only: bool,
     },
     /// Write device settings (admin login, WiFi, ...) into the settings partition over serial.
     Provision(provision::Args),
@@ -168,7 +171,10 @@ fn main() -> Result<()> {
             password,
         } => ota::http(&std::fs::read(image)?, &host, &user, &password),
         Cmd::ImageInfo { image } => image_info(&image),
-        Cmd::TestQemu { release } => qemu::run_tests(release),
+        Cmd::TestQemu {
+            release,
+            zones_only,
+        } => qemu::run_tests(release, zones_only),
         Cmd::Provision(args) => provision::run(&args),
         Cmd::Assemble { app_image, out } => {
             let bl = build_bootloader()?;

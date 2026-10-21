@@ -12,8 +12,8 @@ compile_error!("enable one of the `qemu` (emulator) or `wifi` (hardware) feature
 
 pub use imp::{Peripherals, start};
 
-/// DHCP client/server, 2 web connections, mDNS, plus headroom.
-const SOCKETS: usize = 8;
+/// DHCP client/server, DNS, 2 web connections, mDNS, SNTP, zone client, plus headroom.
+const SOCKETS: usize = 10;
 
 fn resources() -> &'static mut StackResources<SOCKETS> {
     static RES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
@@ -80,8 +80,9 @@ mod imp {
     }
 
     pub async fn start(spawner: &Spawner, _p: Peripherals, dev: Handle) -> Stack<'static> {
-        // Locally administered address; slirp does not care.
-        let driver = OpenEth::new([0x02, 0x00, 0x00, 0x12, 0x34, 0x56])
+        // The emulator assigns the MAC (stable across reboots, unique per VM
+        // when the test harness sets `mac=`).
+        let driver = OpenEth::new()
             .expect("open_eth MAC missing: run under QEMU with `-nic user,model=open_eth`");
         interrupt::bind_handler(Interrupt::ETH_MAC, eth_interrupt);
         let config = embassy_net::Config::dhcpv4(dhcp_config(dev));

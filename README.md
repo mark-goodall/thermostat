@@ -75,6 +75,8 @@ A change takes effect after a reboot.
   status page shows the time left while a switch is held back. The first
   switch after boot is immediate, since the interval is not persisted across
   reboots.
+- **Heater group.** Zones sharing one heater coordinate as described in
+  "Multiple zones on one heater".
 - **Fail-safe.** With no fresh reading from any selected sensor, or none
   selected, heating is off at once.
 - **Output.** Heat demand drives GPIO2, active high. That is the on-board LED on
@@ -93,6 +95,40 @@ Supported sensors:
 | ThermoPro TP357/TP357S/TP35x/TP39x | manufacturer data (company-ID field reused) | recognised by the frame format: `C2` marker, length, trailer bytes, plausible values. A name, if heard, also confirms it. Works with passive scanning. |
 | Xiaomi LYWSD03MMC etc. with pvvx/ATC firmware | service data `0x181A` | |
 | any BTHome v2 device (unencrypted) | service data `0xFCD2` | |
+
+## Multiple zones on one heater
+
+Thermostats with the same **heater id** (settings page, or `xtask provision
+--heater-id`) share one heater. Typically their outputs or zone valves are
+wired in parallel, so the heater runs while *any* zone requests heat.
+
+- **Short-cycle protection:** applies to heater transitions only. A zone
+  switching on while another zone already heats, or off while another keeps
+  heating, switches at once. The first zone on and the last zone off wait
+  for the shared interval since the latest heater transition in the group.
+- **Discovery:** each zone advertises `heater=<id>` in its
+  `_thermostat._tcp` mDNS TXT record, and browses for peers every minute.
+- **Events:** `POST /api/zone/event` with
+  `v=1&heater=…&zone=<hostname>&heat=0|1&last=<unix>&ts=<unix>&sig=<hex>`.
+  - Sent at once when a zone's request changes, and every 30 s as a keepalive.
+  - The reply carries the receiver's own state.
+  - `last` is the latest heater transition the sender knows of. Zones keep
+    the maximum, so everyone shares one timer; this needs NTP.
+- **Liveness:** a zone not heard from for 90 s no longer counts as
+  requesting heat.
+- **Group key** (optional, same on all zones): messages are signed with
+  HMAC-SHA256 and must be within 5 minutes of the receiver's clock.
+  Unsigned groups accept any message for their heater id.
+- **Inspection:** `GET /api/zone` shows this zone and its peers. The status
+  page lists the zones and whether each is heating, idle or silent.
+
+Known limit: if two zones decide to switch off within the same few seconds,
+each may still believe the other is heating, so the heater can stop slightly
+early.
+
+Tested in QEMU with two emulated zones behind a learning switch (`xtask
+test-qemu`), and on hardware against a second zone emulated by a Python
+script on the LAN.
 
 ## Time (NTP)
 

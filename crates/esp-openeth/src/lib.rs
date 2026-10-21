@@ -114,8 +114,23 @@ pub struct OpenEth {
 }
 
 impl OpenEth {
-    /// Reset and configure the MAC. Can only be called once.
-    pub fn new(mac: [u8; 6]) -> Option<Self> {
+    /// Reset and configure the MAC, keeping the address the emulator assigned
+    /// (QEMU's `-nic ...,mac=` option; stable across guest reboots like an
+    /// eFuse MAC). Can only be called once.
+    pub fn new() -> Option<Self> {
+        if !is_present() {
+            return None;
+        }
+        // The reset loads the configured address into the MAC registers.
+        write(reg::MODER, MODER_RST);
+        write(reg::MODER, 0);
+        let [_, _, b0, b1] = read(reg::MAC_ADDR1).to_be_bytes();
+        let [b2, b3, b4, b5] = read(reg::MAC_ADDR0).to_be_bytes();
+        Self::with_mac([b0, b1, b2, b3, b4, b5])
+    }
+
+    /// Reset and configure the MAC with an explicit address.
+    pub fn with_mac(mac: [u8; 6]) -> Option<Self> {
         if TAKEN.swap(true, Ordering::AcqRel) || !is_present() {
             return None;
         }

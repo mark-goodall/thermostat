@@ -81,7 +81,7 @@ struct Emulator {
     writer: TcpStream,
     http: String,
     log_path: PathBuf,
-    tap: qemu::FrameTap,
+    tap: Option<qemu::FrameTap>,
 }
 
 impl Emulator {
@@ -92,12 +92,29 @@ impl Emulator {
             local: free_port()?,
             remote: free_port()?,
         };
-        let mut cmd = qemu::command(
+        let cmd = qemu::command(
             flash,
             http_port,
             &qemu::Console::Tcp(serial_port),
             Some(&tap),
         )?;
+        Self::spawn(
+            cmd,
+            serial_port,
+            log_path,
+            format!("127.0.0.1:{http_port}"),
+            Some(tap),
+        )
+    }
+
+    /// Start QEMU from a prepared command whose console is a TCP server on `serial_port`.
+    fn spawn(
+        mut cmd: std::process::Command,
+        serial_port: u16,
+        log_path: &Path,
+        http: String,
+        tap: Option<qemu::FrameTap>,
+    ) -> Result<Self> {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -132,7 +149,7 @@ impl Emulator {
             child,
             console,
             writer: stream,
-            http: format!("127.0.0.1:{http_port}"),
+            http,
             log_path: log_path.to_path_buf(),
             tap,
         })
@@ -207,13 +224,8 @@ impl Emulator {
     }
 
     fn mdns(&self, name: &str, qtype: u16) -> Result<mdns::Response> {
-        mdns::query(
-            self.tap.remote,
-            self.tap.local,
-            name,
-            qtype,
-            Duration::from_secs(10),
-        )
+        let tap = self.tap.as_ref().context("no frame tap on this emulator")?;
+        mdns::query(tap.remote, tap.local, name, qtype, Duration::from_secs(10))
     }
 
     /// The device must resolve as `<hostname>.local` and advertise its services.
@@ -328,11 +340,18 @@ fn step(name: &str, f: impl FnOnce() -> Result<()>) -> Result<()> {
     Ok(())
 }
 
-pub fn run(release: bool) -> Result<()> {
+pub fn run(release: bool, zones_only: bool) -> Result<()> {
     let dir = workspace_root().join("target/e2e");
     std::fs::create_dir_all(&dir)?;
     qemu::binary()?;
 
+    if zones_only {
+        let v3 = build_variant(&dir, release, "e2e-3", "")?;
+        let sntp_port = start_sntp_server()?;
+        run_zones(&dir, &v3.flash, sntp_port)?;
+        eprintln!("zone tests passed");
+        return Ok(());
+    }
     let v1 = build_variant(&dir, release, "e2e-1", "")?;
     let v2 = build_variant(&dir, release, "e2e-2", "")?;
     let v3 = build_variant(&dir, release, "e2e-3", "")?;
@@ -513,9 +532,393 @@ pub fn run(release: bool) -> Result<()> {
         Ok(())
     })?;
 
+    drop(emu);
+    run_zones(&dir, &v3.flash, sntp_port)?;
+
     eprintln!(
         "all end-to-end tests passed in {:.0}s",
         started.elapsed().as_secs_f32()
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Two zones sharing a heater.
+
+const GROUP_KEY: &str = "e2e-group-key";
+const E2E_HEATER: &str = "e2e-heater-7f3a";
+
+/// A provisioned zone: flash with its own settings (hostname, sensor, group).
+fn zone_flash(
+    dir: &Path,
+    base_flash: &Path,
+    name: &str,
+    sensor: [u8; 6],
+    sntp_port: u16,
+) -> Result<PathBuf> {
+    use thermostat_core::auth::{DEFAULT_ITERATIONS, PasswordHash};
+    use thermostat_core::settings::{Settings, str32, str48};
+    let settings = Settings {
+        hostname: str32(name),
+        admin_hash: Some(PasswordHash::new(
+            PASSWORD,
+            crate::provision::random_salt()?,
+            DEFAULT_ITERATIONS,
+        )),
+        setpoint_dc: 210,
+        hysteresis_dc: 4,
+        min_switch_min: 2,
+        temp_sensors: heapless::Vec::from_slice(&[sensor]).unwrap(),
+        // Unique id: the emulated zones can reach the real LAN through QEMU's
+        // NAT (including mDNS), so avoid joining a real heater group.
+        heater_id: str32(E2E_HEATER),
+        group_key: str32(GROUP_KEY),
+        ntp_server: str48(&format!("10.0.2.2:{sntp_port}")),
+        ..Settings::default()
+    };
+    let mut flash = std::fs::read(base_flash)?;
+    let part = crate::provision::settings_partition();
+    let image = crate::provision::settings_image(&settings)?;
+    flash[part.offset as usize..part.offset as usize + image.len()].copy_from_slice(&image);
+    let path = dir.join(format!("{name}-flash.bin"));
+    std::fs::write(&path, flash)?;
+    Ok(path)
+}
+
+/// QEMU for one zone: a single NIC on a UDP datagram link to the test switch.
+fn zone_command(
+    flash: &Path,
+    serial_port: u16,
+    link: (u16, u16),
+    mac: &str,
+) -> Result<std::process::Command> {
+    let mut cmd = std::process::Command::new(qemu::binary()?);
+    cmd.args(["-nographic", "-machine", "esp32"])
+        .arg("-drive")
+        .arg(format!("file={},if=mtd,format=raw", flash.display()))
+        .args(["-netdev", &dgram("d0", link)])
+        .args([
+            "-net",
+            &format!("nic,model=open_eth,netdev=d0,macaddr={mac}"),
+            "-monitor",
+            "none",
+        ])
+        .args([
+            "-serial",
+            &format!("tcp:127.0.0.1:{serial_port},server=on,wait=on"),
+        ]);
+    Ok(cmd)
+}
+
+fn dgram(id: &str, (local, remote): (u16, u16)) -> String {
+    format!(
+        "dgram,id={id},local.type=inet,local.host=127.0.0.1,local.port={local},\
+         remote.type=inet,remote.host=127.0.0.1,remote.port={remote}"
+    )
+}
+
+/// A guest-less QEMU acting as the router: user-mode NAT (DHCP, DNS, the
+/// host's NTP server, HTTP port forwards) on one switch port.
+struct Router {
+    child: std::process::Child,
+    monitor: u16,
+}
+
+impl Router {
+    fn start(link: (u16, u16)) -> Result<Self> {
+        let monitor = free_port()?;
+        let child = std::process::Command::new(qemu::binary()?)
+            .args(["-machine", "none", "-nographic", "-serial", "none"])
+            .args(["-netdev", "user,id=u0", "-netdev", &dgram("d0", link)])
+            .args([
+                "-netdev",
+                "hubport,id=h0,hubid=0,netdev=u0",
+                "-netdev",
+                "hubport,id=h1,hubid=0,netdev=d0",
+            ])
+            .args([
+                "-monitor",
+                &format!("tcp:127.0.0.1:{monitor},server=on,wait=off"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("starting router qemu")?;
+        Ok(Self { child, monitor })
+    }
+}
+
+impl Drop for Router {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A learning Ethernet switch over UDP: each port is a socket exchanging raw
+/// frames with one QEMU `dgram` netdev. Unicast goes only to the port that
+/// owns the destination MAC (so the router's NAT never sees zone-to-zone
+/// traffic); broadcast and multicast are flooded.
+/// Returns, per port, (switch-side UDP port, QEMU-side UDP port).
+fn start_switch(ports: usize) -> Result<std::vec::Vec<(u16, u16)>> {
+    use std::collections::HashMap;
+    use std::net::UdpSocket;
+    let mut sockets = std::vec::Vec::new();
+    let mut links = std::vec::Vec::new();
+    for _ in 0..ports {
+        let sock = UdpSocket::bind("127.0.0.1:0")?;
+        let qemu_port = free_port()?;
+        links.push((sock.local_addr()?.port(), qemu_port));
+        sockets.push((sock, qemu_port));
+    }
+    let table: Arc<Mutex<HashMap<[u8; 6], usize>>> = Arc::default();
+    let senders: Arc<std::vec::Vec<(UdpSocket, u16)>> = Arc::new(
+        sockets
+            .iter()
+            .map(|(s, p)| (s.try_clone().unwrap(), *p))
+            .collect(),
+    );
+    for (i, (sock, _)) in sockets.into_iter().enumerate() {
+        let (table, senders) = (table.clone(), senders.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok(n) = sock.recv(&mut buf) {
+                if n < 14 {
+                    continue;
+                }
+                let frame = &buf[..n];
+                let dst: [u8; 6] = frame[0..6].try_into().unwrap();
+                let src: [u8; 6] = frame[6..12].try_into().unwrap();
+                let out = {
+                    let mut t = table.lock().unwrap();
+                    t.insert(src, i);
+                    if dst[0] & 1 == 0 {
+                        t.get(&dst).copied()
+                    } else {
+                        None
+                    }
+                };
+                for (j, (s, qemu_port)) in senders.iter().enumerate() {
+                    if j != i && out.is_none_or(|o| o == j) {
+                        let _ = s.send_to(frame, ("127.0.0.1", *qemu_port));
+                    }
+                }
+            }
+        });
+    }
+    Ok(links)
+}
+
+fn monitor_command(port: u16, command: &str) -> Result<()> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_millis(500)))?;
+    s.write_all(format!("{command}\n").as_bytes())?;
+    std::thread::sleep(Duration::from_millis(500));
+    let mut out = [0u8; 4096];
+    let _ = s.read(&mut out);
+    Ok(())
+}
+
+/// Wait for "network up: eth 10.0.2.N" and return the address.
+fn wait_ip(emu: &Emulator) -> Result<String> {
+    emu.wait_log(0, "network up: eth ", Duration::from_secs(90))?;
+    let log = String::from_utf8_lossy(&emu.console.lock().unwrap().log).into_owned();
+    let line = log
+        .lines()
+        .find(|l| l.contains("network up: eth "))
+        .context("no address line")?;
+    let ip = line
+        .split("network up: eth ")
+        .nth(1)
+        .context("no address")?;
+    // The line ends with an ANSI colour reset; keep only the address.
+    Ok(ip
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect())
+}
+
+fn zone_status(emu: &Emulator) -> Result<Value> {
+    let (code, body) = emu.request("GET", "/api/zone", &[], b"")?;
+    anyhow::ensure!(code == 200, "zone status {code}");
+    Ok(serde_json::from_str(&body)?)
+}
+
+fn peer_heat(zone: &Value, peer: &str) -> Option<bool> {
+    zone["peers"]
+        .as_array()?
+        .iter()
+        .find(|p| p["zone"] == peer && p["active"] == true)?["heat"]
+        .as_bool()
+}
+
+fn inject(emu: &Emulator, auth: &str, sensor: [u8; 6], temp: &str) -> Result<()> {
+    let a = sensor;
+    let body = format!(
+        "addr={:02X}%3A{:02X}%3A{:02X}%3A{:02X}%3A{:02X}%3A{:02X}&temp={temp}",
+        a[5], a[4], a[3], a[2], a[1], a[0]
+    );
+    let (code, text) = emu.request(
+        "POST",
+        "/api/test/sensor",
+        &[("Authorization", auth)],
+        body.as_bytes(),
+    )?;
+    anyhow::ensure!(code == 200, "inject: {code} {text}");
+    Ok(())
+}
+
+fn heating(s: &Value) -> bool {
+    s["heating"] == true
+}
+
+pub fn run_zones(dir: &Path, base_flash: &Path, sntp_port: u16) -> Result<()> {
+    eprintln!("== two zones sharing one heater");
+    let (sensor_a, sensor_b) = ([0xA1; 6], [0xB2; 6]);
+    let flash_a = zone_flash(dir, base_flash, "zone-a", sensor_a, sntp_port)?;
+    let flash_b = zone_flash(dir, base_flash, "zone-b", sensor_b, sntp_port)?;
+    // Switch ports: 0 = router (NAT), 1 = zone A, 2 = zone B.
+    let links = start_switch(3)?;
+    let router = Router::start((links[0].1, links[0].0))?;
+    let monitor = router.monitor;
+    let (serial_a, serial_b) = (free_port()?, free_port()?);
+    let mut a = Emulator::spawn(
+        zone_command(
+            &flash_a,
+            serial_a,
+            (links[1].1, links[1].0),
+            "02:00:00:00:00:0a",
+        )?,
+        serial_a,
+        &dir.join("console-zone-a.log"),
+        String::new(),
+        None,
+    )?;
+    let mut b = Emulator::spawn(
+        zone_command(
+            &flash_b,
+            serial_b,
+            (links[2].1, links[2].0),
+            "02:00:00:00:00:0b",
+        )?,
+        serial_b,
+        &dir.join("console-zone-b.log"),
+        String::new(),
+        None,
+    )?;
+    let basic = format!(
+        "Basic {}",
+        ota::base64(format!("admin:{PASSWORD}").as_bytes())
+    );
+
+    step("both zones get addresses, port forwards, NTP time", || {
+        for emu in [&mut a, &mut b] {
+            let ip = wait_ip(emu)?;
+            let port = free_port()?;
+            monitor_command(
+                monitor,
+                &format!("hostfwd_add u0 tcp:127.0.0.1:{port}-{ip}:80"),
+            )?;
+            emu.http = format!("127.0.0.1:{port}");
+        }
+        for emu in [&a, &b] {
+            emu.wait_status("NTP time", Duration::from_secs(90), |s| {
+                !s["time"].is_null()
+            })?;
+        }
+        Ok(())
+    })?;
+
+    step("zones discover each other via mDNS", || {
+        let deadline = Instant::now() + Duration::from_secs(150);
+        loop {
+            let (za, zb) = (zone_status(&a)?, zone_status(&b)?);
+            let found = |z: &Value, peer: &str| {
+                z["peers"]
+                    .as_array()
+                    .is_some_and(|p| p.iter().any(|p| p["zone"] == peer && !p["addr"].is_null()))
+            };
+            if found(&za, "zone-b") && found(&zb, "zone-a") {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                bail!("discovery incomplete: A {za} / B {zb}");
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    })?;
+
+    step("zone A requests heat: heater on, B learns it", || {
+        inject(&a, &basic, sensor_a, "19.0")?;
+        a.wait_status("A heating", Duration::from_secs(30), heating)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while peer_heat(&zone_status(&b)?, "zone-a") != Some(true) {
+            anyhow::ensure!(Instant::now() < deadline, "B never heard A's heat request");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        Ok(())
+    })?;
+
+    step("zone B joins at once (heater already running)", || {
+        inject(&b, &basic, sensor_b, "19.0")?;
+        let s = b.wait_status("B heating", Duration::from_secs(30), heating)?;
+        anyhow::ensure!(s["hold_remaining_s"].is_null(), "B should not be held: {s}");
+        Ok(())
+    })?;
+
+    step("zone A stops at once (B keeps the heater on)", || {
+        inject(&a, &basic, sensor_a, "23.0")?;
+        let s = a.wait_status("A off", Duration::from_secs(30), |s| !heating(s))?;
+        anyhow::ensure!(s["heating_reason"] == "above setpoint", "{s}");
+        Ok(())
+    })?;
+
+    step(
+        "zone B is last: held until 2 min after the heater started",
+        || {
+            // Make sure B has heard that A stopped before it decides.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while peer_heat(&zone_status(&b)?, "zone-a") != Some(false) {
+                anyhow::ensure!(Instant::now() < deadline, "B never heard A stop");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            inject(&b, &basic, sensor_b, "23.0")?;
+            let s = b.wait_status("B holding", Duration::from_secs(30), |s| {
+                s["hold_remaining_s"].as_u64().is_some()
+            })?;
+            anyhow::ensure!(heating(&s), "B must keep the heater on while held: {s}");
+            b.wait_status("B off after the hold", Duration::from_secs(150), |s| {
+                !heating(s)
+            })?;
+            Ok(())
+        },
+    )?;
+
+    step(
+        "zone A must wait for the shared timer (B just stopped the heater)",
+        || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while peer_heat(&zone_status(&a)?, "zone-b") != Some(false) {
+                anyhow::ensure!(Instant::now() < deadline, "A never heard B stop");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            inject(&a, &basic, sensor_a, "19.0")?;
+            let s = a.wait_status("A holding", Duration::from_secs(30), |s| {
+                s["hold_remaining_s"].as_u64().is_some()
+            })?;
+            let left = s["hold_remaining_s"].as_u64().unwrap();
+            anyhow::ensure!(
+                !heating(&s) && left > 60,
+                "A should be held off for most of 2 min: {s}"
+            );
+            let (za, zb) = (zone_status(&a)?, zone_status(&b)?);
+            anyhow::ensure!(
+                za["last_switch"] == zb["last_switch"],
+                "zones disagree on the last switch: {za} / {zb}"
+            );
+            Ok(())
+        },
+    )?;
     Ok(())
 }

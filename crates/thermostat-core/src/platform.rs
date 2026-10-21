@@ -9,6 +9,7 @@ use crate::auth::Sessions;
 use crate::ble::BleTable;
 use crate::settings::Settings;
 use crate::store::StoreError;
+use crate::zones::Group;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtaError {
@@ -98,6 +99,12 @@ pub trait Platform: Ota {
     fn sessions<R>(&mut self, f: impl FnOnce(&mut Sessions) -> R) -> R;
     /// The BLE scan results, or `None` when the build has no Bluetooth radio.
     fn ble<R>(&mut self, f: impl FnOnce(Option<&BleTable>) -> R) -> R;
+    /// The other zones of this thermostat's heater group.
+    fn zones<R>(&mut self, f: impl FnOnce(&mut Group) -> R) -> R;
+    /// Test builds (emulator) only: inject a sensor reading. Returns false if unsupported.
+    fn inject_reading(&mut self, _addr: [u8; 6], _temperature_cc: i16) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
