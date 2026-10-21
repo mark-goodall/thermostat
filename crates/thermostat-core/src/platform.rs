@@ -77,6 +77,10 @@ pub struct DeviceStatus {
     pub heating: bool,
     /// Why the heating is in its current state.
     pub heating_reason: &'static str,
+    /// Unix time (seconds), once NTP has synchronised.
+    pub unix_time: Option<i64>,
+    /// Seconds since the last successful NTP sync.
+    pub time_synced_ago_s: Option<u64>,
 }
 
 pub trait Platform: Ota {

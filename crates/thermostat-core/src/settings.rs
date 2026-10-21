@@ -34,6 +34,22 @@ pub struct Settings {
     pub hysteresis_dc: u16,
     /// BLE sensors (addresses in on-air byte order) whose readings drive the thermostat.
     pub temp_sensors: Vec<[u8; 6], MAX_TEMP_SENSORS>,
+    /// NTP server, `host[:port]`.
+    pub ntp_server: Str48,
+    /// POSIX TZ string, e.g. `GMT0BST,M3.5.0/1,M10.5.0` (see `clock::TimeZone`).
+    pub timezone: Str48,
+}
+
+pub type Str48 = String<48>;
+
+pub fn str48(s: &str) -> Str48 {
+    let mut out = String::new();
+    for c in s.chars() {
+        if out.push(c).is_err() {
+            break;
+        }
+    }
+    out
 }
 
 pub const MAX_TEMP_SENSORS: usize = 4;
@@ -49,6 +65,8 @@ impl Default for Settings {
             setpoint_dc: 200,
             hysteresis_dc: 5,
             temp_sensors: Vec::new(),
+            ntp_server: str48("pool.ntp.org"),
+            timezone: str48("UTC0"),
         }
     }
 }
@@ -78,6 +96,8 @@ mod tag {
     pub const SETPOINT: u8 = 6;
     pub const HYSTERESIS: u8 = 7;
     pub const TEMP_SENSORS: u8 = 8;
+    pub const NTP_SERVER: u8 = 9;
+    pub const TIMEZONE: u8 = 10;
 }
 
 struct Writer<'a> {
@@ -110,6 +130,8 @@ impl Settings {
         }
         w.field(tag::SETPOINT, &self.setpoint_dc.to_le_bytes());
         w.field(tag::HYSTERESIS, &self.hysteresis_dc.to_le_bytes());
+        w.field(tag::NTP_SERVER, self.ntp_server.as_bytes());
+        w.field(tag::TIMEZONE, self.timezone.as_bytes());
         if !self.temp_sensors.is_empty() {
             let mut addrs = [0u8; 6 * MAX_TEMP_SENSORS];
             for (i, a) in self.temp_sensors.iter().enumerate() {
@@ -135,6 +157,11 @@ impl Settings {
                     .map(str32)
                     .map_err(|_| DecodeError::BadValue)
             };
+            let text48 = || {
+                core::str::from_utf8(v)
+                    .map(str48)
+                    .map_err(|_| DecodeError::BadValue)
+            };
             match t {
                 tag::HOSTNAME => s.hostname = text()?,
                 tag::WIFI_SSID => s.wifi_ssid = text()?,
@@ -153,6 +180,8 @@ impl Settings {
                     s.hysteresis_dc =
                         u16::from_le_bytes(v.try_into().map_err(|_| DecodeError::BadValue)?)
                 }
+                tag::NTP_SERVER => s.ntp_server = text48()?,
+                tag::TIMEZONE => s.timezone = text48()?,
                 tag::TEMP_SENSORS => {
                     if v.len() % 6 != 0 {
                         return Err(DecodeError::BadValue);
@@ -194,6 +223,8 @@ mod tests {
             }),
             setpoint_dc: -15,
             temp_sensors: Vec::from_slice(&[[1, 2, 3, 4, 5, 6], [9; 6]]).unwrap(),
+            ntp_server: str48("10.0.2.2:12345"),
+            timezone: str48("GMT0BST,M3.5.0/1,M10.5.0"),
             ..Settings::default()
         };
         let mut buf = [0u8; MAX_ENCODED];
@@ -221,6 +252,8 @@ mod tests {
             wifi_ssid: str32(&"s".repeat(40)),
             admin_user: str32(&"u".repeat(40)),
             temp_sensors: Vec::from_slice(&[[0xAA; 6]; MAX_TEMP_SENSORS]).unwrap(),
+            ntp_server: str48(&"n".repeat(48)),
+            timezone: str48(&"t".repeat(48)),
             wifi_psk: Some([0; 32]),
             admin_hash: Some(PasswordHash {
                 salt: [0; 16],

@@ -12,6 +12,7 @@ use esp_storage::FlashStorage;
 use heapless::String;
 use thermostat_core::auth::Sessions;
 use thermostat_core::ble::BleTable;
+use thermostat_core::clock::WallClock;
 use thermostat_core::control::{RoomTemperature, Thermostat};
 use thermostat_core::platform::{BootState, DeviceStatus, Ota, OtaError, Platform};
 use thermostat_core::settings::Settings;
@@ -44,6 +45,8 @@ pub struct Device {
     pub ble: BleTable,
     pub thermostat: Thermostat,
     pub room: Option<RoomTemperature>,
+    /// Wall-clock time, set by SNTP.
+    pub clock: WallClock,
     pub boot: BootState,
     pub network: String<48>,
     pub reboot_requested: bool,
@@ -73,6 +76,7 @@ impl Device {
             ble: BleTable::new(),
             thermostat: Thermostat::new(),
             room: None,
+            clock: WallClock::new(),
             boot,
             network: String::try_from("starting").unwrap(),
             reboot_requested: false,
@@ -204,6 +208,8 @@ impl Platform for Handle {
             sensors_used: d.room.map_or(0, |r| r.sensors),
             heating: d.thermostat.heating(),
             heating_reason: d.thermostat.reason.as_str(),
+            unix_time: d.clock.unix_s(Instant::now().as_micros()),
+            time_synced_ago_s: d.clock.since_sync_s(Instant::now().as_micros()),
         })
     }
 

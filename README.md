@@ -86,13 +86,36 @@ Supported sensors:
 
 | sensor | format | notes |
 |---|---|---|
-| ThermoPro TP357/TP357S/TP35x/TP39x | manufacturer data (company-ID field reused) | identified by name, which can arrive in the scan response, so the scanner uses active scanning |
+| ThermoPro TP357/TP357S/TP35x/TP39x | manufacturer data (company-ID field reused) | recognised by the frame format: `C2` marker, length, trailer bytes, plausible values. A name, if heard, also confirms it. Works with passive scanning. |
 | Xiaomi LYWSD03MMC etc. with pvvx/ATC firmware | service data `0x181A` | |
 | any BTHome v2 device (unencrypted) | service data `0xFCD2` | |
 
+## Time (NTP)
+
+The firmware keeps wall-clock time with SNTP:
+
+- **Server and timezone:** set on the settings page.
+  - NTP server: default `pool.ntp.org`, `host[:port]`, resolved via the DNS
+    server DHCP provides.
+  - Timezone: a POSIX TZ string, default `UTC0`. Examples:
+    `GMT0BST,M3.5.0/1,M10.5.0` (UK), `CET-1CEST,M3.5.0,M10.5.0/3` (central
+    Europe), `EST5EDT,M3.2.0,M11.1.0` (US Eastern).
+- **Sync timing:** the first sync follows network up. After that, every hour
+  and immediately when the server setting changes. Failures retry with
+  backoff (10 s up to 5 min).
+- **Status:** the status page and `/api/status` show local time
+  (`local_time`, RFC 3339 with offset), Unix `time` and `time_synced_ago_s`.
+- **For schedules:** `thermostat_core::clock` provides `WallClock`,
+  `TimeZone::local(unix) -> DateTime` (weekday, `minute_of_day()`, DST flag),
+  and civil-date helpers. These are the building blocks for time-of-day
+  heating programmes.
+
+Before the first sync there is no wall-clock time; anything time-based has to
+fall back to plain setpoint control.
+
 ## Bluetooth (BLE scanner)
 
-The WiFi build also runs a BLE scan (active, for scan-response names) on the same radio (esp-radio
+The WiFi build also runs a passive BLE scan on the same radio (esp-radio
 `ble` + `coex`). It drives the controller with plain HCI through `bt-hci`, so
 no host stack is needed. `/ble` in the web UI (auto-refreshing) and
 `/api/ble` list nearby advertisers with:

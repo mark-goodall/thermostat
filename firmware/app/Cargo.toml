@@ -35,7 +35,7 @@ esp-storage = { workspace = true, features = ["esp32", "embedded-storage"] }
 
 embassy-executor = { workspace = true, features = ["log"] }
 embassy-time = { workspace = true, features = ["log"] }
-embassy-net = { workspace = true, features = ["dhcpv4", "dhcpv4-hostname", "log", "medium-ethernet", "tcp", "udp", "proto-ipv4", "multicast"] }
+embassy-net = { workspace = true, features = ["dhcpv4", "dhcpv4-hostname", "log", "medium-ethernet", "tcp", "udp", "proto-ipv4", "multicast", "dns"] }
 embassy-sync = { workspace = true }
 embassy-futures = { workspace = true }
 embassy-embedded-hal = { workspace = true }

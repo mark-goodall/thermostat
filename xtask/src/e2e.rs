@@ -40,6 +40,29 @@ fn build_variant(dir: &Path, release: bool, version: &str, features: &str) -> Re
     Ok(Image { img, flash })
 }
 
+/// Unix time served by the test SNTP server at start-up: 2030-07-01T12:00:00Z,
+/// a date when UK summer time applies.
+const SNTP_EPOCH: i64 = 1_909_137_600;
+
+/// A tiny SNTP server on localhost for the emulated device to sync from
+/// (QEMU's NAT exposes the host as 10.0.2.2). Its clock starts at
+/// `SNTP_EPOCH` and advances in real time.
+fn start_sntp_server() -> Result<u16> {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let port = sock.local_addr()?.port();
+    let start = Instant::now();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 128];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let now_us = SNTP_EPOCH * 1_000_000 + start.elapsed().as_micros() as i64;
+            if let Some(reply) = thermostat_core::sntp::server_reply(&buf[..n], now_us) {
+                let _ = sock.send_to(&reply, from);
+            }
+        }
+    });
+    Ok(port)
+}
+
 fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
@@ -374,6 +397,34 @@ pub fn run(release: bool) -> Result<()> {
         Ok(())
     })?;
 
+    let sntp_port = start_sntp_server()?;
+    step("NTP time sync with UK timezone", || {
+        let form = format!(
+            "hostname=e2e-host&ssid=&setpoint=21.5&hysteresis=0.4&ntp_server=10.0.2.2%3A{sntp_port}\
+             &timezone=GMT0BST%2CM3.5.0%2F1%2CM10.5.0"
+        );
+        let (code, body) = emu.request("POST", "/settings", &auth, form.as_bytes())?;
+        anyhow::ensure!(
+            code == 200 && body.contains("Saved"),
+            "settings: {code} {body}"
+        );
+        // 2030-07-01T12:00Z served by our SNTP server is 13:00 BST.
+        let s = emu.wait_status("NTP sync", Duration::from_secs(60), |s| {
+            field(s, "local_time").starts_with("2030-07-01T13:0")
+        })?;
+        anyhow::ensure!(
+            field(&s, "local_time").ends_with("+01:00"),
+            "expected BST: {s}"
+        );
+        anyhow::ensure!(
+            s["time"]
+                .as_i64()
+                .is_some_and(|t| (t - SNTP_EPOCH).abs() < 600),
+            "unix time: {s}"
+        );
+        Ok(())
+    })?;
+
     step("HTTP update: trial boot, then confirmation", || {
         let mark = emu.mark();
         let (code, body) = emu.request("POST", "/api/update", &auth, &std::fs::read(&v2.img)?)?;
@@ -391,14 +442,20 @@ pub fn run(release: bool) -> Result<()> {
         Ok(())
     })?;
 
-    step("settings survive the update", || {
-        let s = emu.status()?;
-        anyhow::ensure!(
-            s["provisioned"] == true && s["setpoint"] == 21.5,
-            "settings lost: {s}"
-        );
-        Ok(())
-    })?;
+    step(
+        "settings survive the update; time resyncs after reboot",
+        || {
+            emu.wait_status("NTP resync", Duration::from_secs(60), |s| {
+                field(s, "local_time").starts_with("2030-07-01T13:")
+            })?;
+            let s = emu.status()?;
+            anyhow::ensure!(
+                s["provisioned"] == true && s["setpoint"] == 21.5,
+                "settings lost: {s}"
+            );
+            Ok(())
+        },
+    )?;
 
     step("mDNS advertises the new hostname and version", || {
         emu.check_mdns("e2e-host", "e2e-2")

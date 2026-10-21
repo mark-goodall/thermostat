@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod ble;
+pub mod clock;
 pub mod codec;
 pub mod control;
 pub mod dhcp;
@@ -14,6 +15,7 @@ pub mod http;
 pub mod platform;
 pub mod proto;
 pub mod settings;
+pub mod sntp;
 pub mod store;
 pub mod web;
 

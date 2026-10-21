@@ -178,11 +178,13 @@ fn decode_bthome(d: &[u8]) -> Option<SensorReading> {
 /// ThermoPro TP35x / TP39x / TP59 thermo-hygrometers.
 ///
 /// They abuse the manufacturer data's company ID field: the whole payload is
-/// `marker, temp i16 LE (0.1 °C), humidity %, battery (low 2 bits), ...`.
-/// Identification needs the advertised name (`TP357 (2142)`), as in
-/// thermopro-ble / Theengs Decoder.
-pub fn decode_thermopro(name: &str, manufacturer: &[u8]) -> Option<SensorReading> {
-    if !(name.starts_with("TP35") || name.starts_with("TP39") || name.starts_with("TP59")) {
+/// `0xC2, temp i16 LE (0.1 °C), humidity %, battery (low 2 bits), ...`.
+/// thermopro-ble / Theengs identify the model by its advertised name, which a
+/// passive scan may never receive (it can sit in the scan response), so a
+/// payload that matches the format closely is accepted without the name.
+pub fn decode_thermopro(name: Option<&str>, manufacturer: &[u8]) -> Option<SensorReading> {
+    let named = is_thermopro(name);
+    if !named && !looks_like_thermopro(manufacturer) {
         return None;
     }
     let d = manufacturer.get(..5)?;
@@ -200,6 +202,22 @@ pub fn decode_thermopro(name: &str, manufacturer: &[u8]) -> Option<SensorReading
         humidity_cp: Some(d[3] as u16 * 100),
         battery_pct: battery,
     })
+}
+
+/// Strict structural match of the TP35x frame, for when the name is unknown:
+/// marker, length, plausible values and the fixed trailer bytes seen in
+/// every capture (`2C` for 6-byte frames, `0B 01` for the TP357S).
+fn looks_like_thermopro(d: &[u8]) -> bool {
+    let trailer_ok = match d.len() {
+        6 => d[5] == 0x2C,
+        7 => d[5..7] == [0x0B, 0x01],
+        _ => false,
+    };
+    if !trailer_ok || d[0] != 0xC2 || d[4] & 3 == 3 {
+        return false;
+    }
+    let t = i16::from_le_bytes([d[1], d[2]]);
+    (-400..=700).contains(&t) && d[3] <= 100
 }
 
 pub fn is_thermopro(name: Option<&str>) -> bool {
@@ -253,6 +271,8 @@ pub struct BleDevice {
     pub sensor: Option<SensorReading>,
     /// When `sensor` was last updated from an advertisement.
     pub sensor_ms: u64,
+    /// Recognised sensor family, when it is not obvious from the data.
+    pub model: Option<&'static str>,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub packets: u32,
@@ -328,6 +348,7 @@ impl BleTable {
                     services: Vec::new(),
                     sensor: None,
                     sensor_ms: 0,
+                    model: None,
                     first_seen_ms: now_ms,
                     last_seen_ms: now_ms,
                     packets: 0,
@@ -363,14 +384,15 @@ impl BleTable {
             }
         }
         let mut reading = info.sensor;
-        // ThermoPro readings live in the manufacturer data; the name that
-        // identifies the model may have arrived in an earlier scan response.
-        if let (Some(name), Some(mfr)) = (&dev.name, &info.manufacturer)
-            && let Some(r) = decode_thermopro(name, mfr)
+        // ThermoPro readings live in the manufacturer data; the name (if ever
+        // heard) confirms the model, otherwise the payload format must match.
+        if let Some(mfr) = &info.manufacturer
+            && let Some(r) = decode_thermopro(dev.name.as_deref(), mfr)
         {
             reading = Some(r);
+            dev.model = Some("ThermoPro");
         }
-        if is_thermopro(dev.name.as_deref()) {
+        if dev.model == Some("ThermoPro") {
             dev.company = None; // the "company ID" is really sensor data
         }
         if reading.is_some() {
@@ -504,41 +526,70 @@ mod tests {
     #[test]
     fn decodes_thermopro() {
         // Test vectors from thermopro-ble / Theengs Decoder.
-        let r = decode_thermopro("TP357 (2142)", &[0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C]).unwrap();
+        let r =
+            decode_thermopro(Some("TP357 (2142)"), &[0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C]).unwrap();
         assert_eq!(
             (r.temperature_cc, r.humidity_cp, r.battery_pct),
             (Some(2410), Some(2900), Some(100))
         );
-        let r = decode_thermopro("TP357", &[0xC2, 0x10, 0x01, 0x47, 0x02, 0x2C]).unwrap();
+        let r = decode_thermopro(Some("TP357"), &[0xC2, 0x10, 0x01, 0x47, 0x02, 0x2C]).unwrap();
         assert_eq!((r.temperature_cc, r.humidity_cp), (Some(2720), Some(7100)));
-        let r =
-            decode_thermopro("TP357S (3C62)", &[0xC2, 0xD6, 0x00, 0x43, 0x22, 0x0B, 0x01]).unwrap();
+        let r = decode_thermopro(
+            Some("TP357S (3C62)"),
+            &[0xC2, 0xD6, 0x00, 0x43, 0x22, 0x0B, 0x01],
+        )
+        .unwrap();
         assert_eq!(
             (r.temperature_cc, r.humidity_cp, r.battery_pct),
             (Some(2140), Some(6700), Some(100))
         );
         // -3.5 °C (0xFFDD), 50 %, low battery.
-        let r = decode_thermopro("TP357", &[0xC2, 0xDD, 0xFF, 50, 0]).unwrap();
+        let r = decode_thermopro(Some("TP357"), &[0xC2, 0xDD, 0xFF, 50, 0]).unwrap();
         assert_eq!((r.temperature_cc, r.battery_pct), (Some(-350), Some(1)));
         // Invalid marker frame, wrong name, too short.
-        assert!(decode_thermopro("TP357S", &[0xC2, 0xFF, 0xFF, 0xFF, 0x0B]).is_none());
-        assert!(decode_thermopro("Phone", &[0xC2, 0xF1, 0x00, 0x1D, 0x02]).is_none());
-        assert!(decode_thermopro("TP357", &[0xC2, 0xF1, 0x00]).is_none());
+        assert!(decode_thermopro(Some("TP357S"), &[0xC2, 0xFF, 0xFF, 0xFF, 0x0B]).is_none());
+        assert!(decode_thermopro(Some("Phone"), &[0xC2, 0xF1, 0x00, 0x1D, 0x02]).is_none());
+        assert!(decode_thermopro(Some("TP357"), &[0xC2, 0xF1, 0x00]).is_none());
     }
 
     #[test]
-    fn thermopro_name_from_scan_response() {
+    fn thermopro_without_name() {
+        // Passive scanning: the same reference frames are recognised by format.
+        let r = decode_thermopro(None, &[0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C]).unwrap();
+        assert_eq!((r.temperature_cc, r.humidity_cp), (Some(2410), Some(2900)));
+        let r = decode_thermopro(None, &[0xC2, 0xD6, 0x00, 0x43, 0x22, 0x0B, 0x01]).unwrap();
+        assert_eq!(r.temperature_cc, Some(2140));
+        // Near misses from other manufacturers are not mistaken for sensors.
+        for d in [
+            &[0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2D][..], // wrong trailer
+            &[0xC1, 0xF1, 0x00, 0x1D, 0x02, 0x2C],     // wrong marker
+            &[0xC2, 0x01, 0x10, 0x1D, 0x02, 0x2C],     // 409.7 °C
+            &[0xC2, 0xF1, 0x00, 0xC8, 0x02, 0x2C],     // 200 % humidity
+            &[0xC2, 0xF1, 0x00, 0x1D, 0x03, 0x2C],     // invalid battery code
+            &[0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C, 0x00, 0x00], // wrong length
+        ] {
+            assert!(decode_thermopro(None, d).is_none(), "{d:02x?}");
+        }
+    }
+
+    #[test]
+    fn thermopro_in_table_by_address() {
         let mut t = BleTable::new();
         let a = [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA];
-        let adv = ad(0xFF, &[0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C]);
-        // Advertisement before the name is known: not decoded yet.
-        t.observe(a, 0, -60, &adv, 0);
-        assert_eq!(t.get(&a).unwrap().sensor, None);
-        t.observe(a, 0, -60, &ad(0x09, b"TP357 (2142)"), 100); // scan response
-        t.observe(a, 0, -60, &adv, 2000);
+        t.observe(
+            a,
+            0,
+            -60,
+            &ad(0xFF, &[0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C]),
+            2000,
+        );
         let d = t.get(&a).unwrap();
         assert_eq!(d.sensor.unwrap().temperature_cc, Some(2410));
-        assert_eq!((d.sensor_ms, d.company), (2000, None));
+        assert_eq!(
+            (d.sensor_ms, d.company, d.model),
+            (2000, None, Some("ThermoPro"))
+        );
+        assert_eq!(d.name, None);
     }
 
     #[test]

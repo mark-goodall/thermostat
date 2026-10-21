@@ -84,9 +84,20 @@ pub async fn handle<S: Read + Write, P: Platform>(
                     }
                     write!(
                         w,
-                        ",\"sensors_used\":{},\"heating\":{},\"heating_reason\":\"{}\"}}",
+                        ",\"sensors_used\":{},\"heating\":{},\"heating_reason\":\"{}\"",
                         st.sensors_used, st.heating, st.heating_reason
-                    )
+                    )?;
+                    match (st.unix_time, st.time_synced_ago_s) {
+                        (Some(t), Some(ago)) => {
+                            let tz = crate::clock::TimeZone::parse(&s.timezone).unwrap_or(crate::clock::TimeZone::UTC);
+                            write!(
+                                w,
+                                ",\"time\":{t},\"local_time\":\"{}\",\"time_synced_ago_s\":{ago}}}",
+                                tz.local(t)
+                            )
+                        }
+                        _ => w.write_str(",\"time\":null,\"local_time\":null,\"time_synced_ago_s\":null}"),
+                    }
                 })
                 .await
         }
@@ -366,6 +377,20 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
     }
     s.hysteresis_dc = hyst as u16;
 
+    // Older forms (and scripts) may omit the time fields: keep the stored values.
+    if let Some(raw) = http::form_value(form, "ntp_server") {
+        let server: String<48> = http::url_decode(raw).ok_or("NTP server is too long.")?;
+        crate::sntp::split_server(&server)
+            .ok_or("NTP server must be a host name or address, optionally with :port.")?;
+        s.ntp_server = server;
+    }
+    if let Some(raw) = http::form_value(form, "timezone") {
+        let tz: String<48> = http::url_decode(raw).ok_or("Timezone is too long.")?;
+        crate::clock::TimeZone::parse(&tz)
+            .map_err(|_| "Timezone must be a POSIX TZ string such as GMT0BST,M3.5.0/1,M10.5.0.")?;
+        s.timezone = tz;
+    }
+
     s.temp_sensors.clear();
     for raw in http::form_values(form, "sensor") {
         let text: String<24> = http::url_decode(raw).ok_or("Invalid sensor address.")?;
@@ -620,10 +645,38 @@ fn status_page(
     }
     write!(
         w,
-        "</td></tr><tr><td>Heating</td><td><b>{}</b> <small>({})</small></td></tr>",
+        "</td></tr><tr><td>Heating</td><td><b>{}</b> <small>({})</small></td></tr><tr><td>Time</td><td>",
         if st.heating { "ON" } else { "off" },
         st.heating_reason
     )?;
+    match (st.unix_time, st.time_synced_ago_s) {
+        (Some(t), Some(ago)) => {
+            let tz =
+                crate::clock::TimeZone::parse(&s.timezone).unwrap_or(crate::clock::TimeZone::UTC);
+            let l = tz.local(t);
+            write!(
+                w,
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} <small>(UTC{}{:02}:{:02}{}, synced {} s ago)</small>",
+                l.year,
+                l.month,
+                l.day,
+                l.hour,
+                l.minute,
+                l.second,
+                if l.offset_s < 0 { '-' } else { '+' },
+                l.offset_s.unsigned_abs() / 3600,
+                l.offset_s.unsigned_abs() / 60 % 60,
+                if l.dst { ", DST" } else { "" },
+                ago
+            )?
+        }
+        _ => write!(
+            w,
+            "not synchronised yet <small>(NTP: {})</small>",
+            Escape(&s.ntp_server)
+        )?,
+    }
+    w.write_str("</td></tr>")?;
     w.write_str(
         "</table><form method=post action=/api/reboot onsubmit=\"return confirm('Reboot now?')\">\
 <button>Reboot</button></form>",
@@ -672,7 +725,7 @@ checked sensors' readings (at most {}). Readings older than {} minutes are ignor
             w,
             "<label><input type=checkbox name=sensor value={}{checked} style=width:auto> {} <code>{}</code> · ",
             d.addr_string(),
-            Escape(d.name.as_deref().unwrap_or("")),
+            Escape(d.name.as_deref().or(d.model).unwrap_or("")),
             d.addr_string()
         )?;
         if let Some(r) = &d.sensor {
@@ -718,7 +771,10 @@ fn settings_form(
 </fieldset><fieldset><legend>Thermostat</legend>\
 <label>Setpoint (°C)<input name=setpoint value=\"{}\" inputmode=decimal></label>\
 <label>Hysteresis (°C)<input name=hysteresis value=\"{}\" inputmode=decimal></label>\
-</fieldset>",
+</fieldset><fieldset><legend>Time</legend>\
+<label>NTP server (host or host:port)<input name=ntp_server value=\"{}\" maxlength=48 required></label>\
+<label>Timezone (POSIX TZ, e.g. GMT0BST,M3.5.0/1,M10.5.0 · CET-1CEST,M3.5.0,M10.5.0/3 · EST5EDT,M3.2.0,M11.1.0 · UTC0)\
+<input name=timezone value=\"{}\" maxlength=48 required></label></fieldset>",
         Escape(&s.hostname),
         Escape(&s.wifi_ssid),
         if s.wifi_psk.is_some() {
@@ -728,6 +784,8 @@ fn settings_form(
         },
         Tenths(s.setpoint_dc as i32),
         Tenths(s.hysteresis_dc as i32),
+        Escape(&s.ntp_server),
+        Escape(&s.timezone),
     )?;
     sensor_fieldset(w, s, found, now)?;
     w.write_str(
@@ -791,7 +849,9 @@ fn ble_page(w: &mut BufWriter<'_>, snap: Option<&BleSnapshot>, now: u64) -> core
             d.rssi,
             Escape(d.name.as_deref().unwrap_or(""))
         )?;
-        if let Some(c) = d.company {
+        if let Some(m) = d.model {
+            w.write_str(m)?;
+        } else if let Some(c) = d.company {
             match crate::ble::company_name(c) {
                 Some(n) => w.write_str(n)?,
                 None => write!(w, "0x{c:04X}")?,
@@ -851,6 +911,9 @@ fn ble_json(w: &mut BufWriter<'_>, snap: Option<&BleSnapshot>, now: u64) -> core
         }
         if let Some(c) = d.company {
             write!(w, ",\"company\":{c}")?;
+        }
+        if let Some(m) = d.model {
+            write!(w, ",\"model\":\"{m}\"")?;
         }
         if let Some(r) = &d.sensor {
             if let Some(t) = r.temperature_cc {
@@ -932,6 +995,7 @@ mod tests {
         saves: usize,
         sessions: crate::auth::Sessions,
         ble: Option<crate::ble::BleTable>,
+        time: Option<i64>,
     }
 
     impl Ota for Fake {
@@ -979,6 +1043,8 @@ mod tests {
                 sensors_used: 0,
                 heating: false,
                 heating_reason: "no sensor reading",
+                unix_time: self.time,
+                time_synced_ago_s: self.time.map(|_| 42),
             }
         }
         fn request_reboot(&mut self) {
@@ -1385,5 +1451,57 @@ mod tests {
             json.contains("\"heating\":false") && json.contains("\"sensors_used\":0"),
             "{json}"
         );
+    }
+
+    #[test]
+    fn time_settings_and_display() {
+        let (mut p, cookie) = provisioned();
+        let base = "hostname=t&ssid=&setpoint=20.0&hysteresis=0.5";
+        let html = get(&mut p, "/", &cookie).text();
+        assert!(html.contains("not synchronised yet") && html.contains("pool.ntp.org"));
+        assert!(
+            get(&mut p, "/api/status", "")
+                .text()
+                .contains("\"local_time\":null")
+        );
+
+        let form = std::format!(
+            "{base}&ntp_server=10.0.2.2%3A12345&timezone=GMT0BST%2CM3.5.0%2F1%2CM10.5.0"
+        );
+        assert!(
+            post(&mut p, "/settings", &cookie, form.as_bytes())
+                .text()
+                .contains("Saved")
+        );
+        assert_eq!(p.settings.ntp_server, "10.0.2.2:12345");
+        assert_eq!(p.settings.timezone, "GMT0BST,M3.5.0/1,M10.5.0");
+        // 2030-07-01T12:00:00Z is 13:00 BST.
+        p.time = Some(1_909_137_600);
+        let json = get(&mut p, "/api/status", "").text();
+        assert!(
+            json.contains("\"local_time\":\"2030-07-01T13:00:00+01:00\""),
+            "{json}"
+        );
+        assert!(
+            get(&mut p, "/", &cookie)
+                .text()
+                .contains("2030-07-01 13:00:00 <small>(UTC+01:00, DST")
+        );
+
+        for (field, msg) in [
+            ("timezone=Mars", "POSIX TZ"),
+            ("ntp_server=bad%20host", "NTP server"),
+        ] {
+            let r = post(
+                &mut p,
+                "/settings",
+                &cookie,
+                std::format!("{base}&{field}").as_bytes(),
+            );
+            assert!(r.text().contains(msg), "{field}");
+        }
+        // Forms without the fields keep the stored values.
+        post(&mut p, "/settings", &cookie, base.as_bytes());
+        assert_eq!(p.settings.timezone, "GMT0BST,M3.5.0/1,M10.5.0");
     }
 }
