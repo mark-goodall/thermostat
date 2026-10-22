@@ -51,8 +51,15 @@ impl<'a> Client<'a> {
         self.seq = self.seq.wrapping_add(1);
         let mut frame = [0u8; MAX_FRAME];
         let n = proto::encode_frame(k, self.seq, payload, &mut frame);
-        for _attempt in 0..5 {
+        for attempt in 0..5 {
             self.port.write_all(&frame[..n])?;
+            if attempt > 0 {
+                // The firmware's UART read wakes on the receive timeout or on
+                // 120 buffered bytes. If a timeout interrupt is missed (seen in
+                // QEMU), a short frame sits unread; delimiter bytes, which the
+                // frame reader skips, push the FIFO past the threshold.
+                self.port.write_all(&[0u8; 128])?;
+            }
             self.port.flush()?;
             if let Some(reply) = self.wait_reply(timeout)? {
                 return Ok(reply);
@@ -198,7 +205,33 @@ pub fn base64(data: &[u8]) -> String {
 }
 
 /// Minimal blocking HTTP request; returns (status, body).
+/// One HTTP request. The device serves two connections at once and its TCP stack
+/// has no SYN backlog, so a connection arriving while both are busy is reset
+/// before any request is read; that case is retried.
 pub fn http_request(
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<(u16, String)> {
+    let mut attempt = 0;
+    loop {
+        match http_request_once(host, method, path, headers, body) {
+            Err(e)
+                if attempt < 3
+                    && e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset) =>
+            {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            r => return r,
+        }
+    }
+}
+
+fn http_request_once(
     host: &str,
     method: &str,
     path: &str,
@@ -225,7 +258,13 @@ pub fn http_request(
         s.write_all(chunk)?;
     }
     let mut resp = Vec::new();
-    s.read_to_end(&mut resp)?;
+    if let Err(e) = s.read_to_end(&mut resp) {
+        // A reset after a complete reply is harmless; one before any reply is
+        // reported (and retried by the caller).
+        if resp.is_empty() || e.kind() != std::io::ErrorKind::ConnectionReset {
+            return Err(e.into());
+        }
+    }
     let text = String::from_utf8_lossy(&resp).into_owned();
     let status = text
         .get(9..12)

@@ -104,7 +104,15 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
         // the heater on, so we may switch off.
         let mut confirmed = false;
         for target in targets {
-            let Some(reply) = post(stack, target, &body, &mut buf).await else {
+            // A peer with both web slots busy resets new connections: retry once.
+            let reply = match post(stack, target, &body, &mut buf).await {
+                Some(r) => Some(r),
+                None => {
+                    Timer::after(Duration::from_millis(300)).await;
+                    post(stack, target, &body, &mut buf).await
+                }
+            };
+            let Some(reply) = reply else {
                 log::warn!("zones: no reply from {:?}", target);
                 continue;
             };

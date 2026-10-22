@@ -672,9 +672,20 @@ impl Drop for Router {
 /// owns the destination MAC (so the router's NAT never sees zone-to-zone
 /// traffic); broadcast and multicast are flooded.
 /// Returns, per port, (switch-side UDP port, QEMU-side UDP port).
-fn start_switch(ports: usize) -> Result<std::vec::Vec<(u16, u16)>> {
+/// A learning Ethernet switch between QEMU `-netdev dgram` ports. Every frame
+/// is also written to `pcap` (for reading failures in Wireshark/tcpdump).
+fn start_switch(ports: usize, pcap: &Path) -> Result<std::vec::Vec<(u16, u16)>> {
     use std::collections::HashMap;
     use std::net::UdpSocket;
+    let mut file = std::fs::File::create(pcap)?;
+    // pcap global header: magic, v2.4, tz 0, sigfigs 0, snaplen 65535, Ethernet.
+    file.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
+    file.write_all(&2u16.to_le_bytes())?;
+    file.write_all(&4u16.to_le_bytes())?;
+    file.write_all(&[0; 8])?;
+    file.write_all(&65535u32.to_le_bytes())?;
+    file.write_all(&1u32.to_le_bytes())?;
+    let pcap = Arc::new(Mutex::new(file));
     let mut sockets = std::vec::Vec::new();
     let mut links = std::vec::Vec::new();
     for _ in 0..ports {
@@ -691,7 +702,7 @@ fn start_switch(ports: usize) -> Result<std::vec::Vec<(u16, u16)>> {
             .collect(),
     );
     for (i, (sock, _)) in sockets.into_iter().enumerate() {
-        let (table, senders) = (table.clone(), senders.clone());
+        let (table, senders, pcap) = (table.clone(), senders.clone(), pcap.clone());
         std::thread::spawn(move || {
             let mut buf = [0u8; 2048];
             while let Ok(n) = sock.recv(&mut buf) {
@@ -699,6 +710,18 @@ fn start_switch(ports: usize) -> Result<std::vec::Vec<(u16, u16)>> {
                     continue;
                 }
                 let frame = &buf[..n];
+                {
+                    let t = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let mut rec = std::vec::Vec::with_capacity(16 + n);
+                    rec.extend_from_slice(&(t.as_secs() as u32).to_le_bytes());
+                    rec.extend_from_slice(&t.subsec_micros().to_le_bytes());
+                    rec.extend_from_slice(&(n as u32).to_le_bytes());
+                    rec.extend_from_slice(&(n as u32).to_le_bytes());
+                    rec.extend_from_slice(frame);
+                    let _ = pcap.lock().unwrap().write_all(&rec);
+                }
                 let dst: [u8; 6] = frame[0..6].try_into().unwrap();
                 let src: [u8; 6] = frame[6..12].try_into().unwrap();
                 let out = {
@@ -790,7 +813,7 @@ pub fn run_zones(dir: &Path, base_flash: &Path, sntp_port: u16) -> Result<()> {
     let flash_a = zone_flash(dir, base_flash, "zone-a", sensor_a, sntp_port)?;
     let flash_b = zone_flash(dir, base_flash, "zone-b", sensor_b, sntp_port)?;
     // Switch ports: 0 = router (NAT), 1 = zone A, 2 = zone B.
-    let links = start_switch(3)?;
+    let links = start_switch(3, &dir.join("zones.pcap"))?;
     let router = Router::start((links[0].1, links[0].0))?;
     let monitor = router.monitor;
     let (serial_a, serial_b) = (free_port()?, free_port()?);
