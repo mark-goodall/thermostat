@@ -8,7 +8,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Output;
-use thermostat_core::control::{GroupState, room_temperature};
+use thermostat_core::control::{GroupState, cc_to_dc, readings};
+use thermostat_core::http::Tenths;
 
 use crate::device::Handle;
 
@@ -27,8 +28,8 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
     loop {
         let now = Instant::now().as_millis();
         let (heat, request, room, reason, grouped) = dev.with(|d| {
-            let room = room_temperature(&d.ble, &d.settings.temp_sensors, now);
-            d.room = room;
+            let room = readings(&d.ble, &d.settings.temp_sensors, now);
+            d.readings = room.clone();
             let min_on_ms = d.settings.min_on_min as u64 * 60_000;
             let now_unix = d.clock.unix_s(Instant::now().as_micros());
             let grouped = !d.settings.heater_id.is_empty();
@@ -46,14 +47,9 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
             } else {
                 GroupState::STANDALONE
             };
-            let heat = d.thermostat.update(
-                room,
-                d.settings.setpoint_dc,
-                d.settings.hysteresis_dc,
-                min_on_ms,
-                group,
-                now,
-            );
+            let heat = d
+                .thermostat
+                .update(&room, d.settings.hysteresis_dc, min_on_ms, group, now);
             if d.thermostat.take_heater_started() {
                 d.group.note_heater_on(now_unix);
             }
@@ -72,16 +68,23 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
             last_request = Some(request);
         }
         if last != Some(heat) {
-            match room {
-                Some(r) => log::info!(
-                    "heating {} ({reason}; room {}.{} °C from {} sensor(s))",
-                    if heat { "ON" } else { "off" },
-                    r.tenths() / 10,
-                    (r.tenths() % 10).abs(),
-                    r.sensors
-                ),
-                None => log::info!("heating {} ({reason})", if heat { "ON" } else { "off" }),
+            // e.g. "heating ON (a sensor is below its setpoint; 19.0/21.0 °C, 18.6/18.0 °C)"
+            let mut temps = heapless::String::<96>::new();
+            for r in &room {
+                let sep = if temps.is_empty() { "; " } else { ", " };
+                let _ = core::fmt::write(
+                    &mut temps,
+                    format_args!(
+                        "{sep}{}/{} °C",
+                        Tenths(cc_to_dc(r.temperature_cc) as i32),
+                        Tenths(r.setpoint_dc as i32)
+                    ),
+                );
             }
+            log::info!(
+                "heating {} ({reason}{temps})",
+                if heat { "ON" } else { "off" }
+            );
             last = Some(heat);
         }
         select(Timer::after(PERIOD), RECHECK.wait()).await;

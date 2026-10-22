@@ -71,10 +71,8 @@ pub struct DeviceStatus {
     pub uptime_s: u64,
     /// Human-readable network state, e.g. "wifi 192.168.1.20" or "ap setup".
     pub network: String<48>,
-    /// Room temperature in tenths of °C from the selected sensors, if any is fresh.
-    pub temperature_dc: Option<i16>,
-    /// Number of selected sensors that contributed to `temperature_dc`.
-    pub sensors_used: u8,
+    /// Fresh readings of the selected sensors, each with its setpoint.
+    pub readings: crate::control::Readings,
     pub heating: bool,
     /// What this zone tells its heater group: it keeps the heater on. False while
     /// releasing (output still on, waiting for another zone to confirm).

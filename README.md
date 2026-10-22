@@ -64,12 +64,20 @@ A change takes effect after a reboot.
 
 ## Heating control
 
-- **Sensors.** On the settings page, check up to 4 BLE temperature sensors.
-  The page lists sensors currently heard that report a temperature, plus any
-  already selected. The room temperature is the average of their readings
-  newer than 10 minutes.
-- **Hysteresis** (settings page, 0.1–5.0 °C). Heating turns on at or below
-  `setpoint − hysteresis/2` and off at or above `setpoint + hysteresis/2`.
+- **Sensors.** On the settings page, check up to 4 BLE temperature sensors and
+  give each its own setpoint (5.0–35.0 °C). The page lists sensors currently
+  heard that report a temperature, plus any already selected. A newly checked
+  sensor starts at the default setpoint. Only readings newer than 10 minutes
+  count.
+- **Hysteresis** (settings page, 0.1–5.0 °C), applied to each sensor against
+  its own setpoint:
+  - Heating turns **on** as soon as *any* sensor is at or below
+    `setpoint − hysteresis/2`.
+  - It turns **off** once *every* sensor is at or above `setpoint + hysteresis/2`
+    (and the minimum on time has passed).
+  - Otherwise it stays as it is.
+  - The status page and `/api/status` (`sensors`) show each sensor's reading,
+    setpoint and band (`below`, `in band`, `above`).
 - **Short-cycle protection = minimum heater on time** (settings page,
   minutes; default 240 = 4 h, 0 disables it, maximum 1440).
   - A request for heat is never delayed.
@@ -85,8 +93,8 @@ A change takes effect after a reboot.
   status LED on GPIO23 blinks at 1 Hz while the relay is on and 0.2 Hz while it
   is off. Pins are set in `main.rs`.
 - **Status.** The status page and `/api/status` show the room temperature, the
-  number of sensors used, the heating state and the reason (`below setpoint`,
-  `within hysteresis band`, `keeping the heater on for its minimum on time`,
+  per-sensor readings, the heating state and the reason (`a sensor is below its
+  setpoint`, `all sensors above setpoint`, `within hysteresis band`, `keeping the heater on for its minimum on time`,
   `checking that another zone keeps the heater on`, …).
 
 Logic: `thermostat-core/src/control.rs` (host-tested). Loop: `firmware/app/src/heating.rs` (every 5 s).

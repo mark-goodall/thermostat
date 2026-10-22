@@ -28,14 +28,15 @@ pub struct Settings {
     pub admin_user: Str32,
     /// `None` until the first-time setup has chosen an admin password.
     pub admin_hash: Option<PasswordHash>,
-    /// Target temperature in tenths of a degree Celsius.
+    /// Default target temperature (tenths of °C) for a newly selected sensor;
+    /// each sensor then has its own setpoint (`temp_sensors`).
     pub setpoint_dc: i16,
     /// Switching hysteresis in tenths of a degree Celsius.
     pub hysteresis_dc: u16,
     /// Minimum heater on time in minutes (short-cycle protection).
     pub min_on_min: u16,
-    /// BLE sensors (addresses in on-air byte order) whose readings drive the thermostat.
-    pub temp_sensors: Vec<[u8; 6], MAX_TEMP_SENSORS>,
+    /// BLE sensors whose readings drive the thermostat, each with its setpoint.
+    pub temp_sensors: Vec<TempSensor, MAX_TEMP_SENSORS>,
     /// Heater group: thermostats with the same id share one heater and its
     /// short-cycle protection. Empty = this thermostat has its own heater.
     pub heater_id: Str32,
@@ -60,6 +61,22 @@ pub fn str48(s: &str) -> Str48 {
 }
 
 pub const MAX_TEMP_SENSORS: usize = 4;
+
+/// A temperature sensor selected to control the heating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TempSensor {
+    /// BLE address in on-air byte order.
+    pub addr: [u8; 6],
+    /// Target temperature for this sensor's room, tenths of °C.
+    pub setpoint_dc: i16,
+}
+
+impl Settings {
+    /// The selected sensor with this address.
+    pub fn temp_sensor(&self, addr: &[u8; 6]) -> Option<&TempSensor> {
+        self.temp_sensors.iter().find(|t| &t.addr == addr)
+    }
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -111,6 +128,9 @@ mod tag {
     pub const MIN_ON: u8 = 11;
     pub const HEATER_ID: u8 = 12;
     pub const GROUP_KEY: u8 = 13;
+    /// One i16 per entry of TEMP_SENSORS, same order. Settings written before
+    /// per-sensor setpoints lack it; those sensors take SETPOINT.
+    pub const SENSOR_SETPOINTS: u8 = 14;
 }
 
 struct Writer<'a> {
@@ -154,16 +174,21 @@ impl Settings {
         w.field(tag::TIMEZONE, self.timezone.as_bytes());
         if !self.temp_sensors.is_empty() {
             let mut addrs = [0u8; 6 * MAX_TEMP_SENSORS];
-            for (i, a) in self.temp_sensors.iter().enumerate() {
-                addrs[i * 6..i * 6 + 6].copy_from_slice(a);
+            let mut setpoints = [0u8; 2 * MAX_TEMP_SENSORS];
+            for (i, t) in self.temp_sensors.iter().enumerate() {
+                addrs[i * 6..i * 6 + 6].copy_from_slice(&t.addr);
+                setpoints[i * 2..i * 2 + 2].copy_from_slice(&t.setpoint_dc.to_le_bytes());
             }
-            w.field(tag::TEMP_SENSORS, &addrs[..self.temp_sensors.len() * 6]);
+            let n = self.temp_sensors.len();
+            w.field(tag::TEMP_SENSORS, &addrs[..n * 6]);
+            w.field(tag::SENSOR_SETPOINTS, &setpoints[..n * 2]);
         }
         w.pos
     }
 
     pub fn decode(mut data: &[u8]) -> Result<Self, DecodeError> {
         let mut s = Settings::default();
+        let mut setpoints: Option<&[u8]> = None;
         while !data.is_empty() {
             if data.len() < 3 {
                 return Err(DecodeError::Truncated);
@@ -214,11 +239,26 @@ impl Settings {
                     }
                     s.temp_sensors.clear();
                     for a in v.as_chunks::<6>().0.iter().take(MAX_TEMP_SENSORS) {
-                        let _ = s.temp_sensors.push(*a);
+                        let _ = s.temp_sensors.push(TempSensor {
+                            addr: *a,
+                            setpoint_dc: i16::MIN, // filled in below
+                        });
                     }
+                }
+                tag::SENSOR_SETPOINTS => {
+                    if v.len() % 2 != 0 {
+                        return Err(DecodeError::BadValue);
+                    }
+                    setpoints = Some(v);
                 }
                 _ => {} // from a newer firmware; ignore
             }
+        }
+        let setpoints = setpoints.unwrap_or(&[]).as_chunks::<2>().0;
+        for (i, t) in s.temp_sensors.iter_mut().enumerate() {
+            t.setpoint_dc = setpoints
+                .get(i)
+                .map_or(s.setpoint_dc, |b| i16::from_le_bytes(*b));
         }
         Ok(s)
     }
@@ -248,7 +288,17 @@ mod tests {
                 hash: [2; 32],
             }),
             setpoint_dc: -15,
-            temp_sensors: Vec::from_slice(&[[1, 2, 3, 4, 5, 6], [9; 6]]).unwrap(),
+            temp_sensors: Vec::from_slice(&[
+                TempSensor {
+                    addr: [1, 2, 3, 4, 5, 6],
+                    setpoint_dc: 215,
+                },
+                TempSensor {
+                    addr: [9; 6],
+                    setpoint_dc: -40,
+                },
+            ])
+            .unwrap(),
             ntp_server: str48("10.0.2.2:12345"),
             min_on_min: 90,
             heater_id: str32("boiler"),
@@ -275,12 +325,44 @@ mod tests {
     }
 
     #[test]
+    fn sensors_without_setpoints_take_the_default() {
+        // Written by a firmware before per-sensor setpoints: no SENSOR_SETPOINTS.
+        let mut buf = std::vec::Vec::new();
+        buf.extend_from_slice(&[tag::SETPOINT, 2, 0]);
+        buf.extend_from_slice(&195i16.to_le_bytes());
+        buf.extend_from_slice(&[tag::TEMP_SENSORS, 12, 0]);
+        buf.extend_from_slice(&[1; 6]);
+        buf.extend_from_slice(&[2; 6]);
+        let s = Settings::decode(&buf).unwrap();
+        assert_eq!(
+            s.temp_sensors.as_slice(),
+            &[
+                TempSensor {
+                    addr: [1; 6],
+                    setpoint_dc: 195
+                },
+                TempSensor {
+                    addr: [2; 6],
+                    setpoint_dc: 195
+                }
+            ]
+        );
+        assert_eq!(s.temp_sensor(&[2; 6]).unwrap().setpoint_dc, 195);
+    }
+
+    #[test]
     fn max_size_fits() {
         let s = Settings {
             hostname: str32(&"h".repeat(40)),
             wifi_ssid: str32(&"s".repeat(40)),
             admin_user: str32(&"u".repeat(40)),
-            temp_sensors: Vec::from_slice(&[[0xAA; 6]; MAX_TEMP_SENSORS]).unwrap(),
+            temp_sensors: Vec::from_slice(
+                &[TempSensor {
+                    addr: [0xAA; 6],
+                    setpoint_dc: 0,
+                }; MAX_TEMP_SENSORS],
+            )
+            .unwrap(),
             ntp_server: str48(&"n".repeat(48)),
             heater_id: str32(&"h".repeat(32)),
             group_key: str32(&"k".repeat(32)),

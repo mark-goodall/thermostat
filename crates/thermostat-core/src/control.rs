@@ -1,7 +1,10 @@
-//! Heating control: room temperature from the selected BLE sensors, and an
-//! on/off decision with hysteresis.
+//! Heating control: readings from the selected BLE sensors, each with its own
+//! setpoint, and an on/off decision with hysteresis.
+
+use heapless::Vec;
 
 use crate::ble::BleTable;
+use crate::settings::{MAX_TEMP_SENSORS, TempSensor};
 
 /// A sensor reading older than this is ignored.
 pub const READING_MAX_AGE_MS: u64 = 10 * 60 * 1000;
@@ -15,55 +18,94 @@ pub const MAX_MIN_ON_MIN: u16 = 24 * 60;
 // otherwise the table, not the age rule, decides when a sensor drops out.
 const _: () = assert!(crate::ble::EXPIRY_MS > READING_MAX_AGE_MS);
 
-/// Room temperature from the selected sensors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RoomTemperature {
-    /// Average of the fresh readings, in hundredths of a degree Celsius.
-    pub temperature_cc: i32,
-    /// How many selected sensors contributed.
-    pub sensors: u8,
+/// Hundredths of a degree to tenths, rounded.
+pub fn cc_to_dc(t: i32) -> i16 {
+    ((t + if t >= 0 { 5 } else { -5 }) / 10) as i16
 }
 
-impl RoomTemperature {
-    /// The temperature in tenths of a degree (rounded).
-    pub fn tenths(&self) -> i16 {
-        let t = self.temperature_cc;
-        ((t + if t >= 0 { 5 } else { -5 }) / 10) as i16
+/// Where one sensor stands against its setpoint and the hysteresis band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Band {
+    /// At or below `setpoint - hysteresis/2`: wants heat.
+    Below,
+    Inside,
+    /// At or above `setpoint + hysteresis/2`: warm enough.
+    Above,
+}
+
+impl Band {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Band::Below => "below",
+            Band::Inside => "in band",
+            Band::Above => "above",
+        }
     }
 }
 
-/// Average the fresh temperature readings of the `selected` sensors.
-pub fn room_temperature(
-    table: &BleTable,
-    selected: &[[u8; 6]],
-    now_ms: u64,
-) -> Option<RoomTemperature> {
-    let mut sum = 0i32;
-    let mut n = 0u8;
-    for addr in selected {
-        let Some(dev) = table.get(addr) else { continue };
+/// A fresh reading from a selected sensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SensorReading {
+    pub addr: [u8; 6],
+    /// Hundredths of a degree Celsius.
+    pub temperature_cc: i32,
+    /// Tenths of a degree Celsius.
+    pub setpoint_dc: i16,
+}
+
+impl SensorReading {
+    pub fn band(&self, hysteresis_dc: u16) -> Band {
+        let half = hysteresis_dc as i32 * 10 / 2;
+        let setpoint = self.setpoint_dc as i32 * 10;
+        if self.temperature_cc <= setpoint - half {
+            Band::Below
+        } else if self.temperature_cc >= setpoint + half {
+            Band::Above
+        } else {
+            Band::Inside
+        }
+    }
+}
+
+pub type Readings = Vec<SensorReading, MAX_TEMP_SENSORS>;
+
+/// The fresh temperature readings of the selected sensors.
+pub fn readings(table: &BleTable, selected: &[TempSensor], now_ms: u64) -> Readings {
+    let mut out = Readings::new();
+    for sel in selected {
+        let Some(dev) = table.get(&sel.addr) else {
+            continue;
+        };
         let Some(t) = dev.sensor.and_then(|r| r.temperature_cc) else {
             continue;
         };
         if now_ms.saturating_sub(dev.sensor_ms) > READING_MAX_AGE_MS {
             continue;
         }
-        sum += t as i32;
-        n += 1;
+        let _ = out.push(SensorReading {
+            addr: sel.addr,
+            temperature_cc: t as i32,
+            setpoint_dc: sel.setpoint_dc,
+        });
     }
-    (n > 0).then(|| RoomTemperature {
-        temperature_cc: sum / n as i32,
-        sensors: n,
-    })
+    out
+}
+
+/// Average of the readings in tenths of a degree (for display).
+pub fn average_dc(readings: &[SensorReading]) -> Option<i16> {
+    let n = readings.len() as i32;
+    (n > 0).then(|| cc_to_dc(readings.iter().map(|r| r.temperature_cc).sum::<i32>() / n))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     /// No fresh reading from any selected sensor (or none selected): off.
     NoReading,
+    /// At least one sensor is at or below its setpoint minus half the hysteresis.
     BelowBand,
+    /// Every sensor is at or above its setpoint plus half the hysteresis.
     AboveBand,
-    /// Inside the hysteresis band: keep the current state.
+    /// Neither: keep the current state.
     InBand,
     /// Warm enough, but the heater has not yet run for its minimum on time.
     MinOnTime,
@@ -171,9 +213,10 @@ impl Thermostat {
         }
     }
 
-    /// Decide whether to heat. Heating turns on at or below
-    /// `setpoint - hysteresis/2` and off at or above `setpoint + hysteresis/2`
-    /// (tenths of °C).
+    /// Decide whether to heat from the fresh `readings`, each against its own
+    /// setpoint. Heating turns on as soon as any sensor is at or below
+    /// `setpoint - hysteresis/2`, and off once every sensor is at or above
+    /// `setpoint + hysteresis/2` (tenths of °C).
     ///
     /// Short-cycle protection is a minimum heater **on** time: a request for
     /// heat is always acted on at once. The last zone switching off keeps the
@@ -187,26 +230,23 @@ impl Thermostat {
     /// both hold the heater on rather than both switching it off.
     pub fn update(
         &mut self,
-        room: Option<RoomTemperature>,
-        setpoint_dc: i16,
+        readings: &[SensorReading],
         hysteresis_dc: u16,
         min_on_ms: u64,
         group: GroupState,
         now_ms: u64,
     ) -> bool {
         self.hold_until_ms = None;
-        let Some(room) = room else {
+        if readings.is_empty() {
             self.reason = Reason::NoReading;
             self.heating = false;
             self.releasing = None;
             return false;
-        };
-        let t = room.temperature_cc;
-        let half = hysteresis_dc as i32 * 10 / 2;
-        let setpoint = setpoint_dc as i32 * 10;
-        let (want, reason) = if t <= setpoint - half {
+        }
+        let band = |b| readings.iter().filter(move |r| r.band(hysteresis_dc) == b);
+        let (want, reason) = if band(Band::Below).next().is_some() {
             (true, Reason::BelowBand)
-        } else if t >= setpoint + half {
+        } else if band(Band::Above).count() == readings.len() {
             (false, Reason::AboveBand)
         } else {
             (self.requesting(), Reason::InBand)
@@ -261,8 +301,8 @@ impl Reason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Reason::NoReading => "no sensor reading",
-            Reason::BelowBand => "below setpoint",
-            Reason::AboveBand => "above setpoint",
+            Reason::BelowBand => "a sensor is below its setpoint",
+            Reason::AboveBand => "all sensors above setpoint",
             Reason::InBand => "within hysteresis band",
             Reason::MinOnTime => "keeping the heater on for its minimum on time",
             Reason::Releasing => "checking that another zone keeps the heater on",
@@ -281,35 +321,49 @@ mod tests {
         v
     }
 
-    fn room(t_cc: i32) -> Option<RoomTemperature> {
-        Some(RoomTemperature {
+    /// One sensor with setpoint 20.0 °C.
+    fn room(t_cc: i32) -> [SensorReading; 1] {
+        [reading(1, t_cc, 200)]
+    }
+
+    fn reading(id: u8, t_cc: i32, setpoint_dc: i16) -> SensorReading {
+        SensorReading {
+            addr: [id; 6],
             temperature_cc: t_cc,
-            sensors: 1,
-        })
+            setpoint_dc,
+        }
+    }
+
+    fn sel(id: u8, setpoint_dc: i16) -> TempSensor {
+        TempSensor {
+            addr: [id; 6],
+            setpoint_dc,
+        }
     }
 
     #[test]
-    fn averages_fresh_selected_sensors() {
+    fn fresh_readings_of_selected_sensors() {
         let mut t = BleTable::new();
-        let (a, b, c) = ([1; 6], [2; 6], [3; 6]);
-        t.observe(a, 0, -50, &pvvx(2000), 1_000);
-        t.observe(b, 0, -50, &pvvx(2150), 1_000);
-        t.observe(c, 0, -50, &pvvx(3000), 1_000); // not selected
-        let r = room_temperature(&t, &[a, b], 2_000).unwrap();
-        assert_eq!((r.temperature_cc, r.sensors, r.tenths()), (2075, 2, 208));
-        // Unknown or stale sensors are skipped.
-        t.observe(b, 0, -50, &pvvx(2150), 1_000 + READING_MAX_AGE_MS);
-        let r = room_temperature(&t, &[a, b, [9; 6]], 1_001 + READING_MAX_AGE_MS).unwrap();
-        assert_eq!((r.temperature_cc, r.sensors), (2150, 1));
-        assert_eq!(room_temperature(&t, &[], 0), None);
+        t.observe([1; 6], 0, -50, &pvvx(2000), 1_000);
+        t.observe([2; 6], 0, -50, &pvvx(2150), 1_000);
+        t.observe([3; 6], 0, -50, &pvvx(3000), 1_000); // not selected
+        let r = readings(&t, &[sel(1, 200), sel(2, 180)], 2_000);
         assert_eq!(
-            RoomTemperature {
-                temperature_cc: -255,
-                sensors: 1
-            }
-            .tenths(),
-            -26
+            r.as_slice(),
+            &[reading(1, 2000, 200), reading(2, 2150, 180)]
         );
+        assert_eq!(average_dc(&r), Some(208));
+        // Unknown or stale sensors are skipped.
+        t.observe([2; 6], 0, -50, &pvvx(2150), 1_000 + READING_MAX_AGE_MS);
+        let r = readings(
+            &t,
+            &[sel(1, 200), sel(2, 180), sel(9, 200)],
+            1_001 + READING_MAX_AGE_MS,
+        );
+        assert_eq!(r.as_slice(), &[reading(2, 2150, 180)]);
+        assert!(readings(&t, &[], 0).is_empty());
+        assert_eq!(average_dc(&[]), None);
+        assert_eq!(cc_to_dc(-255), -26);
     }
 
     #[test]
@@ -319,22 +373,88 @@ mod tests {
         // Nine minutes on (and after the table's periodic expiry), still used.
         let now = 9 * 60_000;
         t.expire(now);
-        assert!(room_temperature(&t, &[[1; 6]], now).is_some());
-        assert!(room_temperature(&t, &[[1; 6]], READING_MAX_AGE_MS + 1).is_none());
+        assert_eq!(readings(&t, &[sel(1, 200)], now).len(), 1);
+        assert!(readings(&t, &[sel(1, 200)], READING_MAX_AGE_MS + 1).is_empty());
+    }
+
+    #[test]
+    fn any_sensor_low_turns_on_all_high_turns_off() {
+        // Hysteresis 1.0: each sensor is low at <= setpoint - 0.5, high at >= setpoint + 0.5.
+        let s = GroupState::STANDALONE;
+        let mut th = Thermostat::new();
+        // Living room 21.0 (setpoint 21.0: in band), bedroom 17.6 (setpoint 18.0: in band).
+        assert!(!th.update(&[reading(1, 2100, 210), reading(2, 1760, 180)], 10, 0, s, 0));
+        assert_eq!(th.reason, Reason::InBand);
+        // Bedroom drops to 17.5: one sensor low is enough.
+        assert!(th.update(&[reading(1, 2200, 210), reading(2, 1750, 180)], 10, 0, s, 1));
+        assert_eq!(th.reason, Reason::BelowBand);
+        // Bedroom warm (18.5), living room only in band: keeps heating.
+        assert!(th.update(&[reading(1, 2140, 210), reading(2, 1850, 180)], 10, 0, s, 2));
+        assert_eq!(th.reason, Reason::InBand);
+        // Living room low while the bedroom is well above: heats.
+        assert!(th.update(&[reading(1, 2050, 210), reading(2, 2500, 180)], 10, 0, s, 3));
+        assert_eq!(th.reason, Reason::BelowBand);
+        // Both at or above their setpoint + 0.5: off.
+        assert!(!th.update(&[reading(1, 2150, 210), reading(2, 1850, 180)], 10, 0, s, 4));
+        assert_eq!(th.reason, Reason::AboveBand);
+        // A sensor going stale (missing) leaves the decision to the others.
+        assert!(th.update(&[reading(2, 1700, 180)], 10, 0, s, 5));
+    }
+
+    #[test]
+    fn all_high_still_respects_minimum_on_time() {
+        let min = 60_000;
+        let s = GroupState::STANDALONE;
+        let mut th = Thermostat::new();
+        assert!(th.update(
+            &[reading(1, 1800, 200), reading(2, 2500, 180)],
+            10,
+            min,
+            s,
+            0
+        ));
+        // Everyone warm after 30 s: held for the rest of the minute.
+        assert!(th.update(
+            &[reading(1, 2100, 200), reading(2, 2500, 180)],
+            10,
+            min,
+            s,
+            30_000
+        ));
+        assert_eq!(th.reason, Reason::MinOnTime);
+        assert!(!th.update(
+            &[reading(1, 2100, 200), reading(2, 2500, 180)],
+            10,
+            min,
+            s,
+            min
+        ));
+    }
+
+    #[test]
+    fn band_per_sensor() {
+        let r = |t| reading(1, t, 200);
+        assert_eq!(r(1950).band(10), Band::Below);
+        assert_eq!(r(1951).band(10), Band::Inside);
+        assert_eq!(r(2049).band(10), Band::Inside);
+        assert_eq!(r(2050).band(10), Band::Above);
+        // Zero hysteresis: at the setpoint counts as low (heat wins).
+        assert_eq!(r(2000).band(0), Band::Below);
+        assert_eq!(r(2001).band(0), Band::Above);
     }
 
     #[test]
     fn hysteresis_band() {
         let mut th = Thermostat::new();
         // Setpoint 20.0, hysteresis 1.0: on at <= 19.5, off at >= 20.5.
-        assert!(!th.update(room(1960), 200, 10, 0, GroupState::STANDALONE, 0));
+        assert!(!th.update(&room(1960), 10, 0, GroupState::STANDALONE, 0));
         assert_eq!(th.reason, Reason::InBand);
-        assert!(th.update(room(1950), 200, 10, 0, GroupState::STANDALONE, 0));
+        assert!(th.update(&room(1950), 10, 0, GroupState::STANDALONE, 0));
         assert!(
-            th.update(room(2040), 200, 10, 0, GroupState::STANDALONE, 1),
+            th.update(&room(2040), 10, 0, GroupState::STANDALONE, 1),
             "stays on inside the band"
         );
-        assert!(!th.update(room(2050), 200, 10, 0, GroupState::STANDALONE, 2));
+        assert!(!th.update(&room(2050), 10, 0, GroupState::STANDALONE, 2));
         assert_eq!(th.reason, Reason::AboveBand);
     }
 
@@ -342,12 +462,11 @@ mod tests {
     fn minimum_on_time() {
         let four_h = DEFAULT_MIN_ON_MIN as u64 * 60_000;
         let mut th = Thermostat::new();
-        assert!(th.update(room(1800), 200, 10, four_h, GroupState::STANDALONE, 0));
+        assert!(th.update(&room(1800), 10, four_h, GroupState::STANDALONE, 0));
         assert!(th.take_heater_started());
         // Warm after 3 h: kept on for the rest of the 4 h.
         assert!(th.update(
-            room(2200),
-            200,
+            &room(2200),
             10,
             four_h,
             GroupState::STANDALONE,
@@ -355,7 +474,7 @@ mod tests {
         ));
         assert_eq!(th.reason, Reason::MinOnTime);
         assert_eq!(th.hold_remaining_ms(3 * 3_600_000), Some(3_600_000));
-        assert!(!th.update(room(2200), 200, 10, four_h, GroupState::STANDALONE, four_h));
+        assert!(!th.update(&room(2200), 10, four_h, GroupState::STANDALONE, four_h));
         assert_eq!(th.hold_remaining_ms(four_h), None);
     }
 
@@ -363,12 +482,11 @@ mod tests {
     fn heat_is_never_delayed() {
         let four_h = DEFAULT_MIN_ON_MIN as u64 * 60_000;
         let mut th = Thermostat::new();
-        assert!(th.update(room(1800), 200, 10, four_h, GroupState::STANDALONE, 0));
-        assert!(!th.update(room(2200), 200, 10, four_h, GroupState::STANDALONE, four_h));
+        assert!(th.update(&room(1800), 10, four_h, GroupState::STANDALONE, 0));
+        assert!(!th.update(&room(2200), 10, four_h, GroupState::STANDALONE, four_h));
         // Cold again a minute after switching off: heats at once.
         assert!(th.update(
-            room(1800),
-            200,
+            &room(1800),
             10,
             four_h,
             GroupState::STANDALONE,
@@ -380,7 +498,7 @@ mod tests {
             others_heating: true,
             heater_on_since_ms: Some(five_s()),
         };
-        assert!(other.update(room(1800), 200, 10, four_h, busy, five_s()));
+        assert!(other.update(&room(1800), 10, four_h, busy, five_s()));
         assert!(!other.take_heater_started(), "joined a running heater");
     }
 
@@ -401,26 +519,26 @@ mod tests {
         };
         let mut th = Thermostat::new();
         // Another zone started the heater at t=0; we join at 10 s.
-        assert!(th.update(room(1800), 200, 10, min, busy(0), 10_000));
+        assert!(th.update(&room(1800), 10, min, busy(0), 10_000));
         // Leaving while the other zone still heats: released once it confirms.
-        assert!(th.update(room(2200), 200, 10, min, busy(0), 20_000));
+        assert!(th.update(&room(2200), 10, min, busy(0), 20_000));
         let r = th.release_pending().unwrap();
         th.released(r, true);
         assert!(!th.heating());
         // Join again, then the other zone leaves: we are the last zone, so the
         // heater stays on until 2 min after it started (t=0), not after we joined.
-        assert!(th.update(room(1800), 200, 10, min, busy(0), 30_000));
-        assert!(th.update(room(2200), 200, 10, min, alone(0), 60_000));
+        assert!(th.update(&room(1800), 10, min, busy(0), 30_000));
+        assert!(th.update(&room(2200), 10, min, alone(0), 60_000));
         assert_eq!(th.hold_remaining_ms(60_000), Some(60_000));
-        assert!(!th.update(room(2200), 200, 10, min, alone(0), min));
+        assert!(!th.update(&room(2200), 10, min, alone(0), min));
         // If the start time is unknown, our own switch-on time is used.
         let mut late = Thermostat::new();
         let unknown = GroupState {
             others_heating: true,
             heater_on_since_ms: None,
         };
-        assert!(late.update(room(1800), 200, 10, min, unknown, 50_000));
-        assert!(late.update(room(2200), 200, 10, min, GroupState::STANDALONE, 60_000));
+        assert!(late.update(&room(1800), 10, min, unknown, 50_000));
+        assert!(late.update(&room(2200), 10, min, GroupState::STANDALONE, 60_000));
         assert_eq!(late.hold_remaining_ms(60_000), Some(110_000));
     }
 
@@ -432,16 +550,16 @@ mod tests {
             heater_on_since_ms: Some(0),
         };
         let mut th = Thermostat::new();
-        assert!(th.update(room(1800), 200, 10, min, busy, 0));
+        assert!(th.update(&room(1800), 10, min, busy, 0));
         assert!(th.requesting());
         // Warm: stops requesting but keeps the output on while it asks.
-        assert!(th.update(room(2200), 200, 10, min, busy, 10_000));
+        assert!(th.update(&room(2200), 10, min, busy, 10_000));
         assert_eq!(th.reason, Reason::Releasing);
         assert!(th.heating() && !th.requesting());
         let r = th.release_pending().unwrap();
         // Later updates keep the same release (no new request per loop),
         // also when the temperature dips back into the band.
-        assert!(th.update(room(2000), 200, 10, min, busy, 15_000));
+        assert!(th.update(&room(2000), 10, min, busy, 15_000));
         assert_eq!(th.release_pending(), Some(r));
         // An answer to an older release does nothing.
         th.released(r.wrapping_sub(1), true);
@@ -449,7 +567,7 @@ mod tests {
         th.released(r, true);
         assert!(!th.heating() && th.release_pending().is_none());
         // Off, inside the band: stays off.
-        assert!(!th.update(room(2000), 200, 10, min, busy, 20_000));
+        assert!(!th.update(&room(2000), 10, min, busy, 20_000));
     }
 
     #[test]
@@ -461,10 +579,10 @@ mod tests {
             heater_on_since_ms: Some(0),
         };
         let (mut a, mut b) = (Thermostat::new(), Thermostat::new());
-        assert!(a.update(room(1800), 200, 10, min, both, 0));
-        assert!(b.update(room(1800), 200, 10, min, both, 0));
-        assert!(a.update(room(2200), 200, 10, min, both, 10_000));
-        assert!(b.update(room(2200), 200, 10, min, both, 10_000));
+        assert!(a.update(&room(1800), 10, min, both, 0));
+        assert!(b.update(&room(1800), 10, min, both, 0));
+        assert!(a.update(&room(2200), 10, min, both, 10_000));
+        assert!(b.update(&room(2200), 10, min, both, 10_000));
         // Each asks the other, which answers heat=0: neither is confirmed.
         assert!(!a.requesting() && !b.requesting());
         a.released(a.release_pending().unwrap(), false);
@@ -474,13 +592,13 @@ mod tests {
             others_heating: false,
             heater_on_since_ms: Some(0),
         };
-        assert!(a.update(room(2200), 200, 10, min, alone, 11_000));
-        assert!(b.update(room(2200), 200, 10, min, alone, 11_000));
+        assert!(a.update(&room(2200), 10, min, alone, 11_000));
+        assert!(b.update(&room(2200), 10, min, alone, 11_000));
         assert_eq!((a.reason, b.reason), (Reason::MinOnTime, Reason::MinOnTime));
         assert!(a.requesting() && b.requesting());
         // The minimum on time over, both switch off without asking.
-        assert!(!a.update(room(2200), 200, 10, min, both, min));
-        assert!(!b.update(room(2200), 200, 10, min, both, min));
+        assert!(!a.update(&room(2200), 10, min, both, min));
+        assert!(!b.update(&room(2200), 10, min, both, min));
     }
 
     #[test]
@@ -491,19 +609,19 @@ mod tests {
             heater_on_since_ms: Some(0),
         };
         let mut th = Thermostat::new();
-        assert!(th.update(room(1800), 200, 10, min, busy, 0));
-        assert!(th.update(room(2200), 200, 10, min, busy, 1_000));
+        assert!(th.update(&room(1800), 10, min, busy, 0));
+        assert!(th.update(&room(2200), 10, min, busy, 1_000));
         let r = th.release_pending().unwrap();
         // Cold again before the answer: keeps heating, the late answer is ignored.
-        assert!(th.update(room(1800), 200, 10, min, busy, 2_000));
+        assert!(th.update(&room(1800), 10, min, busy, 2_000));
         assert!(th.requesting());
         th.released(r, true);
         assert!(th.heating());
         // Release again; meanwhile the other zone's own release arrives, so we
         // become the last zone and hold instead of waiting.
-        assert!(th.update(room(2200), 200, 10, min, busy, 3_000));
+        assert!(th.update(&room(2200), 10, min, busy, 3_000));
         assert!(th.release_pending().is_some());
-        assert!(th.update(room(2200), 200, 10, min, GroupState::STANDALONE, 4_000));
+        assert!(th.update(&room(2200), 10, min, GroupState::STANDALONE, 4_000));
         assert_eq!(th.reason, Reason::MinOnTime);
         assert!(th.release_pending().is_none() && th.requesting());
     }
@@ -511,9 +629,9 @@ mod tests {
     #[test]
     fn fails_safe_without_readings() {
         let mut th = Thermostat::new();
-        assert!(th.update(room(1800), 200, 10, 3_600_000, GroupState::STANDALONE, 0));
+        assert!(th.update(&room(1800), 10, 3_600_000, GroupState::STANDALONE, 0));
         // Losing the sensor switches off immediately, despite the minimum on time.
-        assert!(!th.update(None, 200, 10, 3_600_000, GroupState::STANDALONE, 1_000));
+        assert!(!th.update(&[], 10, 3_600_000, GroupState::STANDALONE, 1_000));
         assert_eq!(th.reason, Reason::NoReading);
     }
 }

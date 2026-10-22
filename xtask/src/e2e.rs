@@ -574,7 +574,11 @@ fn zone_flash(
         setpoint_dc: 210,
         hysteresis_dc: 4,
         min_on_min: 2,
-        temp_sensors: heapless::Vec::from_slice(&[sensor]).unwrap(),
+        temp_sensors: heapless::Vec::from_slice(&[thermostat_core::settings::TempSensor {
+            addr: sensor,
+            setpoint_dc: 210,
+        }])
+        .unwrap(),
         // Unique id: the emulated zones can reach the real LAN through QEMU's
         // NAT (including mDNS), so avoid joining a real heater group.
         heater_id: str32(E2E_HEATER),
@@ -878,7 +882,7 @@ pub fn run_zones(dir: &Path, base_flash: &Path, sntp_port: u16) -> Result<()> {
         || {
             inject(&a, &basic, sensor_a, "23.0")?;
             let s = a.wait_status("A off", Duration::from_secs(30), |s| !heating(s))?;
-            anyhow::ensure!(s["heating_reason"] == "above setpoint", "{s}");
+            anyhow::ensure!(s["heating_reason"] == "all sensors above setpoint", "{s}");
             Ok(())
         },
     )?;

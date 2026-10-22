@@ -13,7 +13,7 @@ use heapless::String;
 use thermostat_core::auth::Sessions;
 use thermostat_core::ble::BleTable;
 use thermostat_core::clock::WallClock;
-use thermostat_core::control::{RoomTemperature, Thermostat};
+use thermostat_core::control::{Readings, Thermostat};
 use thermostat_core::platform::{BootState, DeviceStatus, Ota, OtaError, Platform};
 use thermostat_core::settings::Settings;
 use thermostat_core::store::{SettingsStore, StoreError};
@@ -45,7 +45,7 @@ pub struct Device {
     /// Nearby BLE advertisers (filled by the scanner in WiFi builds).
     pub ble: BleTable,
     pub thermostat: Thermostat,
-    pub room: Option<RoomTemperature>,
+    pub readings: Readings,
     /// Wall-clock time, set by SNTP.
     pub clock: WallClock,
     /// Other zones sharing this thermostat's heater.
@@ -78,7 +78,7 @@ impl Device {
             sessions: Sessions::new(),
             ble: BleTable::new(),
             thermostat: Thermostat::new(),
-            room: None,
+            readings: Readings::new(),
             clock: WallClock::new(),
             group: Group::new(),
             boot,
@@ -208,8 +208,7 @@ impl Platform for Handle {
             boot: d.boot,
             uptime_s: Instant::now().as_secs(),
             network: d.network.clone(),
-            temperature_dc: d.room.map(|r| r.tenths()),
-            sensors_used: d.room.map_or(0, |r| r.sensors),
+            readings: d.readings.clone(),
             heating: d.thermostat.heating(),
             heat_request: d.thermostat.requesting(),
             heating_reason: d.thermostat.reason.as_str(),
