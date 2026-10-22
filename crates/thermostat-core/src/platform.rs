@@ -76,6 +76,9 @@ pub struct DeviceStatus {
     /// Number of selected sensors that contributed to `temperature_dc`.
     pub sensors_used: u8,
     pub heating: bool,
+    /// What this zone tells its heater group: it keeps the heater on. False while
+    /// releasing (output still on, waiting for another zone to confirm).
+    pub heat_request: bool,
     /// Why the heating is in its current state.
     pub heating_reason: &'static str,
     /// Seconds the heater must still run (minimum on time), while held on.

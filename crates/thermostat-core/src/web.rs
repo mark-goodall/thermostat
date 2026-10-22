@@ -969,7 +969,7 @@ fn own_zone_message<P: Platform>(p: &mut P) -> Option<crate::zones::ZoneMessage>
     Some(crate::zones::ZoneMessage {
         heater: s.heater_id,
         zone: s.hostname,
-        heat: st.heating,
+        heat: st.heat_request,
         heater_on_since,
         ts: st.unix_time,
     })
@@ -1312,6 +1312,7 @@ mod tests {
                 temperature_dc: None,
                 sensors_used: 0,
                 heating: false,
+                heat_request: false,
                 heating_reason: "no sensor reading",
                 hold_remaining_s: self.hold,
                 unix_time: self.time,

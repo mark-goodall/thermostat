@@ -11,6 +11,14 @@
 //! v=1&heater=boiler&zone=kitchen&heat=1&on=1792613236&ts=1792613300&sig=<hex>
 //! ```
 //!
+//! `heat=1` means the sender keeps the heater on (it wants heat, or holds the
+//! heater for its minimum on time). A zone that wants to switch off before the
+//! minimum on time while others seem to heat sends `heat=0` first and keeps its
+//! output on; it switches off only if a peer *replies* `heat=1`, i.e. a zone
+//! that now knows it may be the last one. Otherwise it holds the heater itself
+//! (see `control::Thermostat::released`), so two zones leaving at once cannot
+//! both stop the heater early.
+//!
 //! `on` is the Unix time the heater last started, as far as the sender knows
 //! (0 = unknown); zones keep the latest, so all of them time the same run.
 //! `ts` is the sender's clock (replay protection when both sides have NTP
@@ -267,6 +275,17 @@ impl Group {
             .is_some_and(|t| now_ms.saturating_sub(t) < PEER_TIMEOUT_MS)
     }
 
+    /// After asking every peer during a release (started at `round_ms`): peers
+    /// that did not answer no longer count as heating, so we hold the heater
+    /// rather than ask again until they speak up.
+    pub fn settle_release(&mut self, round_ms: u64) {
+        for p in self.peers.iter_mut() {
+            if p.heard_ms.is_none_or(|t| t < round_ms) {
+                p.heat = false;
+            }
+        }
+    }
+
     /// Whether any other zone currently requests heat.
     pub fn others_heating(&self, now_ms: u64) -> bool {
         self.peers.iter().any(|p| p.heat && Self::fresh(p, now_ms))
@@ -413,6 +432,22 @@ mod tests {
         g.receive(&msg("kitchen", false, None, None), 2_000);
         assert!(!g.others_heating(2_000));
         assert_eq!(g.peers().len(), 2);
+    }
+
+    #[test]
+    fn settle_release_forgets_silent_peers() {
+        let mut g = Group::new();
+        g.receive(&msg("kitchen", true, None, None), 1_000);
+        g.receive(&msg("hall", true, None, None), 1_000);
+        // Release round from t=2000: only the hall answers.
+        g.receive(&msg("hall", true, None, None), 2_100);
+        g.settle_release(2_000);
+        let heat: std::vec::Vec<_> = g
+            .peers()
+            .iter()
+            .map(|p| (p.zone.as_str(), p.heat))
+            .collect();
+        assert_eq!(heat, [("kitchen", false), ("hall", true)]);
     }
 
     #[test]

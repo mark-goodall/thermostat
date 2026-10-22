@@ -67,6 +67,9 @@ pub enum Reason {
     InBand,
     /// Warm enough, but the heater has not yet run for its minimum on time.
     MinOnTime,
+    /// Warm enough, and another zone seems to be heating: asking the group to
+    /// confirm before switching off (see [`Thermostat::released`]).
+    Releasing,
 }
 
 /// The rest of the heater group, as seen by this zone (see `zones`).
@@ -95,6 +98,10 @@ pub struct Thermostat {
     started_heater: bool,
     /// While held on: when switching off becomes allowed.
     hold_until_ms: Option<u64>,
+    /// Waiting for the group to confirm that another zone keeps the heater on;
+    /// the number identifies the request.
+    releasing: Option<u32>,
+    release_seq: u32,
     pub reason: Reason,
 }
 
@@ -112,12 +119,42 @@ impl Thermostat {
             on_since_ms: None,
             started_heater: false,
             hold_until_ms: None,
+            releasing: None,
+            release_seq: 0,
             reason: Reason::NoReading,
         }
     }
 
+    /// Whether the heat output is on.
     pub fn heating(&self) -> bool {
         self.heating
+    }
+
+    /// Whether this zone tells the group it keeps the heater on: true while
+    /// heating or held on, false once it has asked to leave (releasing).
+    pub fn requesting(&self) -> bool {
+        self.heating && self.releasing.is_none()
+    }
+
+    /// The release waiting for confirmation, if any (pass it to [`released`](Self::released)).
+    pub fn release_pending(&self) -> Option<u32> {
+        self.releasing
+    }
+
+    /// The group's answer to a release. `confirmed` means another zone replied,
+    /// after hearing that we no longer request heat, that it keeps the heater on,
+    /// so we can switch off. Otherwise we may be the last zone: the output stays
+    /// on and the next [`update`](Self::update) applies the minimum on time.
+    /// Answers to an older or cancelled release are ignored.
+    pub fn released(&mut self, release: u32, confirmed: bool) {
+        if self.releasing != Some(release) {
+            return;
+        }
+        self.releasing = None;
+        if confirmed {
+            self.heating = false;
+            self.reason = Reason::AboveBand;
+        }
     }
 
     /// True once after an update in which this zone switched the heater on
@@ -139,10 +176,15 @@ impl Thermostat {
     /// (tenths of °C).
     ///
     /// Short-cycle protection is a minimum heater **on** time: a request for
-    /// heat is always acted on at once. Switching off is immediate while another
-    /// zone keeps the heater running; the last zone switching off keeps the
+    /// heat is always acted on at once. The last zone switching off keeps the
     /// heater on until it has run for `min_on_ms` since it started. Losing all
     /// readings switches off at once.
+    ///
+    /// A zone that wants to switch off early while `group.others_heating`
+    /// releases instead: it stops requesting heat but keeps its output on until
+    /// the group answers through [`released`](Self::released). Two zones leaving
+    /// at the same moment then both see the other no longer requesting, and
+    /// both hold the heater on rather than both switching it off.
     pub fn update(
         &mut self,
         room: Option<RoomTemperature>,
@@ -156,6 +198,7 @@ impl Thermostat {
         let Some(room) = room else {
             self.reason = Reason::NoReading;
             self.heating = false;
+            self.releasing = None;
             return false;
         };
         let t = room.temperature_cc;
@@ -166,9 +209,12 @@ impl Thermostat {
         } else if t >= setpoint + half {
             (false, Reason::AboveBand)
         } else {
-            (self.heating, Reason::InBand)
+            (self.requesting(), Reason::InBand)
         };
         self.reason = reason;
+        if want {
+            self.releasing = None;
+        }
         if want && !self.heating {
             self.heating = true;
             self.on_since_ms = Some(now_ms);
@@ -177,23 +223,33 @@ impl Thermostat {
                 self.started_heater = true;
             }
         } else if !want && self.heating {
-            if group.others_heating {
-                self.heating = false; // the heater keeps running for the others
-            } else {
-                // We are the last zone: switching off stops the heater. Count its
-                // on time from the latest start we know of; if none is known (we
-                // joined a running heater and never heard when it started), from
-                // when we switched on, which errs on the long side.
-                let since = self
-                    .started_heater_ms
-                    .max(group.heater_on_since_ms)
-                    .or(self.on_since_ms);
-                match since {
-                    Some(since) if now_ms.saturating_sub(since) < min_on_ms => {
+            // Count the heater's on time from the latest start we know of; if none
+            // is known (we joined a running heater and never heard when it
+            // started), from when we switched on, which errs on the long side.
+            let since = self
+                .started_heater_ms
+                .max(group.heater_on_since_ms)
+                .or(self.on_since_ms);
+            match since {
+                Some(since) if now_ms.saturating_sub(since) < min_on_ms => {
+                    if group.others_heating {
+                        // Someone else may keep the heater on: ask before leaving.
+                        if self.releasing.is_none() {
+                            self.release_seq = self.release_seq.wrapping_add(1);
+                            self.releasing = Some(self.release_seq);
+                        }
+                        self.reason = Reason::Releasing;
+                    } else {
+                        // We are the last zone: switching off would stop the heater.
+                        self.releasing = None;
                         self.reason = Reason::MinOnTime;
                         self.hold_until_ms = Some(since + min_on_ms);
                     }
-                    _ => self.heating = false,
+                }
+                // The heater has run long enough: off, whoever else is heating.
+                _ => {
+                    self.heating = false;
+                    self.releasing = None;
                 }
             }
         }
@@ -209,6 +265,7 @@ impl Reason {
             Reason::AboveBand => "above setpoint",
             Reason::InBand => "within hysteresis band",
             Reason::MinOnTime => "keeping the heater on for its minimum on time",
+            Reason::Releasing => "checking that another zone keeps the heater on",
         }
     }
 }
@@ -345,8 +402,11 @@ mod tests {
         let mut th = Thermostat::new();
         // Another zone started the heater at t=0; we join at 10 s.
         assert!(th.update(room(1800), 200, 10, min, busy(0), 10_000));
-        // Leaving while the other zone still heats: immediate.
-        assert!(!th.update(room(2200), 200, 10, min, busy(0), 20_000));
+        // Leaving while the other zone still heats: released once it confirms.
+        assert!(th.update(room(2200), 200, 10, min, busy(0), 20_000));
+        let r = th.release_pending().unwrap();
+        th.released(r, true);
+        assert!(!th.heating());
         // Join again, then the other zone leaves: we are the last zone, so the
         // heater stays on until 2 min after it started (t=0), not after we joined.
         assert!(th.update(room(1800), 200, 10, min, busy(0), 30_000));
@@ -362,6 +422,90 @@ mod tests {
         assert!(late.update(room(1800), 200, 10, min, unknown, 50_000));
         assert!(late.update(room(2200), 200, 10, min, GroupState::STANDALONE, 60_000));
         assert_eq!(late.hold_remaining_ms(60_000), Some(110_000));
+    }
+
+    #[test]
+    fn release_waits_for_confirmation() {
+        let min = 2 * 60_000;
+        let busy = GroupState {
+            others_heating: true,
+            heater_on_since_ms: Some(0),
+        };
+        let mut th = Thermostat::new();
+        assert!(th.update(room(1800), 200, 10, min, busy, 0));
+        assert!(th.requesting());
+        // Warm: stops requesting but keeps the output on while it asks.
+        assert!(th.update(room(2200), 200, 10, min, busy, 10_000));
+        assert_eq!(th.reason, Reason::Releasing);
+        assert!(th.heating() && !th.requesting());
+        let r = th.release_pending().unwrap();
+        // Later updates keep the same release (no new request per loop),
+        // also when the temperature dips back into the band.
+        assert!(th.update(room(2000), 200, 10, min, busy, 15_000));
+        assert_eq!(th.release_pending(), Some(r));
+        // An answer to an older release does nothing.
+        th.released(r.wrapping_sub(1), true);
+        assert!(th.heating());
+        th.released(r, true);
+        assert!(!th.heating() && th.release_pending().is_none());
+        // Off, inside the band: stays off.
+        assert!(!th.update(room(2000), 200, 10, min, busy, 20_000));
+    }
+
+    #[test]
+    fn simultaneous_release_holds_the_heater() {
+        // Zones A and B both heat; both get warm before hearing from each other.
+        let min = 2 * 60_000;
+        let both = GroupState {
+            others_heating: true,
+            heater_on_since_ms: Some(0),
+        };
+        let (mut a, mut b) = (Thermostat::new(), Thermostat::new());
+        assert!(a.update(room(1800), 200, 10, min, both, 0));
+        assert!(b.update(room(1800), 200, 10, min, both, 0));
+        assert!(a.update(room(2200), 200, 10, min, both, 10_000));
+        assert!(b.update(room(2200), 200, 10, min, both, 10_000));
+        // Each asks the other, which answers heat=0: neither is confirmed.
+        assert!(!a.requesting() && !b.requesting());
+        a.released(a.release_pending().unwrap(), false);
+        b.released(b.release_pending().unwrap(), false);
+        // Each now knows the other is not requesting: both hold the heater.
+        let alone = GroupState {
+            others_heating: false,
+            heater_on_since_ms: Some(0),
+        };
+        assert!(a.update(room(2200), 200, 10, min, alone, 11_000));
+        assert!(b.update(room(2200), 200, 10, min, alone, 11_000));
+        assert_eq!((a.reason, b.reason), (Reason::MinOnTime, Reason::MinOnTime));
+        assert!(a.requesting() && b.requesting());
+        // The minimum on time over, both switch off without asking.
+        assert!(!a.update(room(2200), 200, 10, min, both, min));
+        assert!(!b.update(room(2200), 200, 10, min, both, min));
+    }
+
+    #[test]
+    fn release_cancelled_by_demand_or_group() {
+        let min = 2 * 60_000;
+        let busy = GroupState {
+            others_heating: true,
+            heater_on_since_ms: Some(0),
+        };
+        let mut th = Thermostat::new();
+        assert!(th.update(room(1800), 200, 10, min, busy, 0));
+        assert!(th.update(room(2200), 200, 10, min, busy, 1_000));
+        let r = th.release_pending().unwrap();
+        // Cold again before the answer: keeps heating, the late answer is ignored.
+        assert!(th.update(room(1800), 200, 10, min, busy, 2_000));
+        assert!(th.requesting());
+        th.released(r, true);
+        assert!(th.heating());
+        // Release again; meanwhile the other zone's own release arrives, so we
+        // become the last zone and hold instead of waiting.
+        assert!(th.update(room(2200), 200, 10, min, busy, 3_000));
+        assert!(th.release_pending().is_some());
+        assert!(th.update(room(2200), 200, 10, min, GroupState::STANDALONE, 4_000));
+        assert_eq!(th.reason, Reason::MinOnTime);
+        assert!(th.release_pending().is_none() && th.requesting());
     }
 
     #[test]

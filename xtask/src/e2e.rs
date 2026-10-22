@@ -159,6 +159,12 @@ impl Emulator {
         self.console.lock().unwrap().log.len()
     }
 
+    /// Console output since `mark`.
+    fn log_since(&self, mark: usize) -> String {
+        let c = self.console.lock().unwrap();
+        String::from_utf8_lossy(&c.log[mark.min(c.log.len())..]).into_owned()
+    }
+
     /// Wait for `pattern` to appear in the console output after `mark`.
     fn wait_log(&self, mark: usize, pattern: &str, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
@@ -867,12 +873,15 @@ pub fn run_zones(dir: &Path, base_flash: &Path, sntp_port: u16) -> Result<()> {
         Ok(())
     })?;
 
-    step("zone A stops at once (B keeps the heater on)", || {
-        inject(&a, &basic, sensor_a, "23.0")?;
-        let s = a.wait_status("A off", Duration::from_secs(30), |s| !heating(s))?;
-        anyhow::ensure!(s["heating_reason"] == "above setpoint", "{s}");
-        Ok(())
-    })?;
+    step(
+        "zone A stops once B confirms it keeps the heater on",
+        || {
+            inject(&a, &basic, sensor_a, "23.0")?;
+            let s = a.wait_status("A off", Duration::from_secs(30), |s| !heating(s))?;
+            anyhow::ensure!(s["heating_reason"] == "above setpoint", "{s}");
+            Ok(())
+        },
+    )?;
 
     step(
         "zone B is last: heater kept on until 2 min after it started",
@@ -927,6 +936,58 @@ pub fn run_zones(dir: &Path, base_flash: &Path, sntp_port: u16) -> Result<()> {
                 );
                 std::thread::sleep(Duration::from_secs(1));
             }
+        },
+    )?;
+
+    step(
+        "both zones warm at the same moment: heater still runs its minimum on time",
+        || {
+            // A started the heater in the previous step; B joins.
+            inject(&b, &basic, sensor_b, "19.0")?;
+            b.wait_status("B heating", Duration::from_secs(15), heating)?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while peer_heat(&zone_status(&a)?, "zone-b") != Some(true)
+                || peer_heat(&zone_status(&b)?, "zone-a") != Some(true)
+            {
+                anyhow::ensure!(Instant::now() < deadline, "zones never saw each other heat");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            let started = zone_status(&a)?["heater_on_since"]
+                .as_i64()
+                .context("heater start unknown")?;
+            let (mark_a, mark_b) = (a.mark(), b.mark());
+            // Both decide within milliseconds: each still believes the other heats.
+            std::thread::scope(|s| {
+                let ja = s.spawn(|| inject(&a, &basic, sensor_a, "23.0"));
+                let jb = s.spawn(|| inject(&b, &basic, sensor_b, "23.0"));
+                ja.join().unwrap().and(jb.join().unwrap())
+            })?;
+            // Poll until both outputs are off: the heater must never stop early.
+            let deadline = Instant::now() + Duration::from_secs(200);
+            loop {
+                let (sa, sb) = (a.status()?, b.status()?);
+                let now = sa["time"].as_i64().context("no time")?;
+                if !heating(&sa) && !heating(&sb) {
+                    anyhow::ensure!(
+                        now >= started + 120,
+                        "heater stopped {} s after starting (minimum 120): A {sa} / B {sb}",
+                        now - started
+                    );
+                    break;
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "heater never stopped: {sa} / {sb}"
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            let held = |log: String| log.contains("release not confirmed");
+            eprintln!(
+                "   (releases unconfirmed: A {}, B {})",
+                held(a.log_since(mark_a)),
+                held(b.log_since(mark_b))
+            );
+            Ok(())
         },
     )?;
     Ok(())

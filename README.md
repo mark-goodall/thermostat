@@ -86,7 +86,8 @@ A change takes effect after a reboot.
   `main.rs`).
 - **Status.** The status page and `/api/status` show the room temperature, the
   number of sensors used, the heating state and the reason (`below setpoint`,
-  `within hysteresis band`, `waiting for minimum switch interval`, …).
+  `within hysteresis band`, `keeping the heater on for its minimum on time`,
+  `checking that another zone keeps the heater on`, …).
 
 Logic: `thermostat-core/src/control.rs` (host-tested). Loop: `firmware/app/src/heating.rs` (every 5 s).
 
@@ -106,12 +107,20 @@ wired in parallel, so the heater runs while *any* zone requests heat.
 
 - **Minimum on time:** applies to the heater as a whole.
   - Any zone requesting heat gets it at once.
-  - A zone switching off while another still heats switches at once.
   - The last zone switching off keeps the heater on until it has run for the
     minimum time since it *started*, whichever zone started it.
+  - A zone switching off early while another seems to heat **releases**: it
+    sends `heat=0` but keeps its output on. It switches off only if a peer
+    *replies* `heat=1`. That peer has seen the `heat=0`, so it knows it may be
+    the last zone and will hold the heater itself. With no such reply (both
+    zones released at once, a lost message, a silent peer), the zone holds the
+    heater for the rest of the minimum on time. Errors therefore make the
+    heater run longer, never stop early. Leaving costs one HTTP round trip.
+  - Once the minimum on time has passed, any zone switches off at once.
 - **Discovery:** each zone advertises `heater=<id>` in its
   `_thermostat._tcp` mDNS TXT record, and browses for peers every minute.
-- **Events:** `POST /api/zone/event` with
+- **Events:** `POST /api/zone/event` (`heat=1`: the sender keeps the heater
+  on, by wanting heat or holding it) with
   `v=1&heater=…&zone=<hostname>&heat=0|1&on=<unix>&ts=<unix>&sig=<hex>`.
   - Sent at once when a zone's request changes, and every 30 s as a keepalive.
   - The reply carries the receiver's own state.
@@ -124,10 +133,6 @@ wired in parallel, so the heater runs while *any* zone requests heat.
   Unsigned groups accept any message for their heater id.
 - **Inspection:** `GET /api/zone` shows this zone and its peers. The status
   page lists the zones and whether each is heating, idle or silent.
-
-Known limit: if two zones decide to switch off within the same few seconds,
-each may still believe the other is heating, so the heater can stop before
-its minimum on time.
 
 Tested in QEMU with two emulated zones behind a learning switch (`xtask
 test-qemu`), and on hardware against a second zone emulated by a Python

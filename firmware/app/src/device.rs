@@ -211,6 +211,7 @@ impl Platform for Handle {
             temperature_dc: d.room.map(|r| r.tenths()),
             sensors_used: d.room.map_or(0, |r| r.sensors),
             heating: d.thermostat.heating(),
+            heat_request: d.thermostat.requesting(),
             heating_reason: d.thermostat.reason.as_str(),
             hold_remaining_s: d
                 .thermostat
@@ -237,6 +238,9 @@ impl Platform for Handle {
     fn inject_reading(&mut self, addr: [u8; 6], temperature_cc: i16) -> bool {
         let now = Instant::now().as_millis();
         self.with(|d| d.ble.inject(addr, temperature_cc, now));
+        // Act on it now rather than at the next control period, so tests can
+        // make two zones decide at the same moment.
+        crate::heating::RECHECK.signal(());
         true
     }
 

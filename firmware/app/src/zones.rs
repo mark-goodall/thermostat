@@ -82,13 +82,14 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
             let msg = ZoneMessage {
                 heater: s.heater_id.clone(),
                 zone: s.hostname.clone(),
-                heat: d.thermostat.heating(),
+                heat: d.thermostat.requesting(),
                 heater_on_since: d.group.heater_on_since,
                 ts: d.clock.unix_s(now.as_micros()),
             };
             let targets: Vec<([u8; 4], u16), MAX_PEERS> =
                 d.group.targets(now.as_millis()).collect();
             Some((
+                d.thermostat.release_pending(),
                 msg.encode(&s.group_key),
                 targets,
                 s.heater_id.clone(),
@@ -96,9 +97,12 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
                 s.group_key.clone(),
             ))
         });
-        let Some((body, targets, heater, zone, key)) = prepared else {
+        let Some((release, body, targets, heater, zone, key)) = prepared else {
             continue;
         };
+        // During a release, a peer replying heat=1 has seen our heat=0 and keeps
+        // the heater on, so we may switch off.
+        let mut confirmed = false;
         for target in targets {
             let Some(reply) = post(stack, target, &body, &mut buf).await else {
                 log::warn!("zones: no reply from {:?}", target);
@@ -107,10 +111,30 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
             dev.with(|d| {
                 let now_unix = d.clock.unix_s(Instant::now().as_micros());
                 match ZoneMessage::decode(&reply, &heater, &zone, &key, now_unix) {
-                    Ok(m) => d.group.receive(&m, Instant::now().as_millis()),
+                    Ok(m) => {
+                        confirmed |= m.heat;
+                        d.group.receive(&m, Instant::now().as_millis())
+                    }
                     Err(e) => log::warn!("zones: reply from {:?} rejected: {}", target, e.as_str()),
                 }
             });
+        }
+        if let Some(release) = release {
+            dev.with(|d| {
+                if !confirmed {
+                    d.group.settle_release(now.as_millis());
+                }
+                d.thermostat.released(release, confirmed);
+            });
+            log::info!(
+                "zones: release {}",
+                if confirmed {
+                    "confirmed, another zone keeps the heater on"
+                } else {
+                    "not confirmed, holding the heater"
+                }
+            );
+            crate::heating::RECHECK.signal(());
         }
     }
 }
