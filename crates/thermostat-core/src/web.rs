@@ -89,9 +89,14 @@ pub async fn handle<S: Read + Write, P: Platform>(
                     for (i, r) in st.readings.iter().enumerate() {
                         write!(
                             w,
-                            "{}{{\"addr\":\"{}\",\"temperature\":{},\"setpoint\":{},\"band\":\"{}\"}}",
+                            "{}{{\"addr\":\"{}\",\"name\":",
                             if i > 0 { "," } else { "" },
                             crate::ble::format_addr(&r.addr),
+                        )?;
+                        json_str(w, s.temp_sensor(&r.addr).map_or("", |t| t.name.as_str()))?;
+                        write!(
+                            w,
+                            ",\"temperature\":{},\"setpoint\":{},\"band\":\"{}\"}}",
                             Tenths(crate::control::cc_to_dc(r.temperature_cc) as i32),
                             Tenths(r.setpoint_dc as i32),
                             r.band(s.hysteresis_dc).as_str()
@@ -275,8 +280,9 @@ pub async fn handle<S: Read + Write, P: Platform>(
         (Method::Get, "/ble") => {
             let now = p.now_ms();
             let snapshot = p.ble(|t| t.map(|t| (t.sorted(), t.reports, t.scanning, t.error)));
+            let s = p.settings();
             page(sock, page_buf, "Bluetooth", true, |w| {
-                ble_page(w, snapshot.as_ref(), now)
+                ble_page(w, &s, snapshot.as_ref(), now)
             })
             .await
         }
@@ -521,8 +527,9 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
         if s.temp_sensor(&addr).is_some() {
             continue;
         }
-        // Its setpoint field; without one, keep the stored value (or the default).
-        let setpoint_dc = match http::form_value(form, &setpoint_field(&addr)) {
+        let before = previous.iter().find(|t| t.addr == addr);
+        // Its setpoint and name fields; without them, keep the stored values.
+        let setpoint_dc = match http::form_value(form, &sensor_field("sp_", &addr)) {
             Some(raw) => {
                 let text: String<8> = http::url_decode(raw).ok_or("Invalid sensor setpoint.")?;
                 let sp = http::parse_tenths(&text).ok_or("Sensor setpoints must look like 20.5")?;
@@ -531,13 +538,22 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
                 }
                 sp as i16
             }
-            None => previous
-                .iter()
-                .find(|t| t.addr == addr)
-                .map_or(s.setpoint_dc, |t| t.setpoint_dc),
+            None => before.map_or(s.setpoint_dc, |t| t.setpoint_dc),
+        };
+        let name = match http::form_value(form, &sensor_field("nm_", &addr)) {
+            Some(raw) => {
+                let text: String<64> = http::url_decode(raw).ok_or("Sensor name is too long.")?;
+                crate::settings::SensorName::try_from(text.trim())
+                    .map_err(|_| "Sensor names can be at most 16 characters.")?
+            }
+            None => before.map(|t| t.name.clone()).unwrap_or_default(),
         };
         if s.temp_sensors
-            .push(crate::settings::TempSensor { addr, setpoint_dc })
+            .push(crate::settings::TempSensor {
+                addr,
+                setpoint_dc,
+                name,
+            })
             .is_err()
         {
             return Err("Select at most 4 temperature sensors.");
@@ -780,7 +796,8 @@ fn status_page(
         w.write_str("no sensors selected (see Settings)")?;
     }
     for t in &s.temp_sensors {
-        write!(w, "<code>{}</code> ", crate::ble::format_addr(&t.addr))?;
+        sensor_label(w, s, &t.addr)?;
+        w.write_str(" ")?;
         match st.readings.iter().find(|r| r.addr == t.addr) {
             Some(r) => write!(
                 w,
@@ -884,23 +901,40 @@ fn sensor_candidates<P: Platform>(p: &mut P) -> Candidates {
     })
 }
 
-/// Form field holding a sensor's setpoint: `sp_` and the address in hex.
-fn setpoint_field(addr: &[u8; 6]) -> String<16> {
+/// Form field for one sensor: `prefix` (`sp_` setpoint, `nm_` name) and the address in hex.
+fn sensor_field(prefix: &str, addr: &[u8; 6]) -> String<16> {
     let mut f = String::new();
-    let _ = f.push_str("sp_");
+    let _ = f.push_str(prefix);
     for b in addr.iter().rev() {
         let _ = write!(f, "{b:02X}");
     }
     f
 }
 
-fn setpoint_input(w: &mut BufWriter<'_>, addr: &[u8; 6], setpoint_dc: i16) -> core::fmt::Result {
+fn sensor_inputs(
+    w: &mut BufWriter<'_>,
+    addr: &[u8; 6],
+    setpoint_dc: i16,
+    name: &str,
+) -> core::fmt::Result {
     write!(
         w,
-        "<label style=margin-left:2em>Setpoint (°C)<input name={} value={} inputmode=decimal size=5></label>",
-        setpoint_field(addr),
+        "<div style=margin-left:2em><label>Name<input name={} value=\"{}\" maxlength={} placeholder=\"e.g. Landing\"></label>\
+<label>Setpoint (°C)<input name={} value={} inputmode=decimal size=5></label></div>",
+        sensor_field("nm_", addr),
+        Escape(name),
+        crate::settings::MAX_SENSOR_NAME,
+        sensor_field("sp_", addr),
         Tenths(setpoint_dc as i32)
     )
+}
+
+/// `<b>name</b> <code>addr</code>`, or just the address when unnamed.
+fn sensor_label(w: &mut BufWriter<'_>, s: &Settings, addr: &[u8; 6]) -> core::fmt::Result {
+    if let Some(t) = s.temp_sensor(addr).filter(|t| !t.name.is_empty()) {
+        write!(w, "<b>{}</b> ", Escape(&t.name))?;
+    }
+    write!(w, "<code>{}</code>", crate::ble::format_addr(addr))
 }
 
 fn sensor_fieldset(
@@ -911,8 +945,8 @@ fn sensor_fieldset(
 ) -> core::fmt::Result {
     write!(
         w,
-        "<fieldset><legend>Temperature sensors</legend><p><small>Check up to {} sensors and give each its \
-setpoint. Heating comes on when any checked sensor drops to its setpoint minus half the hysteresis, and goes \
+        "<fieldset><legend>Temperature sensors</legend><p><small>Check up to {} sensors and give each a \
+name (shown on these pages only; the sensor itself keeps its own name) and a setpoint. Heating comes on when any checked sensor drops to its setpoint minus half the hysteresis, and goes \
 off once all are at their setpoint plus half the hysteresis (after the minimum on time). Readings older than \
 {} minutes are ignored; with none, heating stays off.</small></p>",
         crate::settings::MAX_TEMP_SENSORS,
@@ -925,10 +959,14 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
         let checked = if selected.is_some() { " checked" } else { "" };
         write!(
             w,
-            "<label><input type=checkbox name=sensor value={}{checked} style=width:auto> {} <code>{}</code> · ",
+            "<label><input type=checkbox name=sensor value={}{checked} style=width:auto> ",
             d.addr_string(),
-            Escape(d.name.as_deref().or(d.model).unwrap_or("")),
-            d.addr_string()
+        )?;
+        sensor_label(w, s, &d.addr)?;
+        write!(
+            w,
+            " {} · ",
+            Escape(d.name.as_deref().or(d.model).unwrap_or(""))
         )?;
         if let Some(r) = &d.sensor {
             sensor_text(w, r)?;
@@ -939,10 +977,11 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
             d.rssi,
             now.saturating_sub(d.sensor_ms) / 1000
         )?;
-        setpoint_input(
+        sensor_inputs(
             w,
             &d.addr,
             selected.map_or(s.setpoint_dc, |t| t.setpoint_dc),
+            selected.map_or("", |t| t.name.as_str()),
         )?;
     }
     for t in &s.temp_sensors {
@@ -951,9 +990,11 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
             let addr = crate::ble::format_addr(&t.addr);
             write!(
                 w,
-                "<label><input type=checkbox name=sensor value={addr} checked style=width:auto> <code>{addr}</code> · not heard recently</label>"
+                "<label><input type=checkbox name=sensor value={addr} checked style=width:auto> "
             )?;
-            setpoint_input(w, &t.addr, t.setpoint_dc)?;
+            sensor_label(w, s, &t.addr)?;
+            w.write_str(" · not heard recently</label>")?;
+            sensor_inputs(w, &t.addr, t.setpoint_dc, &t.name)?;
         }
     }
     if !any {
@@ -1149,7 +1190,12 @@ fn sensor_text(w: &mut BufWriter<'_>, r: &crate::ble::SensorReading) -> core::fm
     Ok(())
 }
 
-fn ble_page(w: &mut BufWriter<'_>, snap: Option<&BleSnapshot>, now: u64) -> core::fmt::Result {
+fn ble_page(
+    w: &mut BufWriter<'_>,
+    s: &Settings,
+    snap: Option<&BleSnapshot>,
+    now: u64,
+) -> core::fmt::Result {
     let Some((devices, reports, scanning, error)) = snap else {
         return w.write_str("<p>This build has no Bluetooth radio (emulator).</p>");
     };
@@ -1172,7 +1218,8 @@ fn ble_page(w: &mut BufWriter<'_>, snap: Option<&BleSnapshot>, now: u64) -> core
 <th>Maker</th><th>Services</th><th>Reading</th><th>Seen</th></tr>",
     )?;
     for d in devices {
-        write!(w, "<tr><td><code>{}</code>", d.addr_string())?;
+        w.write_str("<tr><td>")?;
+        sensor_label(w, s, &d.addr)?;
         if d.addr_kind != crate::ble::AddrKind::Public {
             write!(w, " <small>{}</small>", d.addr_kind.as_str())?;
         }
@@ -1751,6 +1798,7 @@ mod tests {
         let sensor = |setpoint_dc| crate::settings::TempSensor {
             addr: tp,
             setpoint_dc,
+            name: Default::default(),
         };
         assert_eq!(p.settings.temp_sensors.as_slice(), &[sensor(200)]);
         let html = get(&mut p, "/settings", &cookie).text();
@@ -1779,6 +1827,48 @@ mod tests {
             status.contains("no fresh reading · setpoint 18.5 °C"),
             "{status}"
         );
+        // A name of our own, kept when the form omits it.
+        let named = crate::settings::TempSensor {
+            name: crate::settings::SensorName::try_from("Landing <1>").unwrap(),
+            ..sensor(185)
+        };
+        let form = std::format!(
+            "{base}&sensor=AA%3ABB%3ACC%3ADD%3AEE%3AFF&nm_AABBCCDDEEFF=+Landing+%3C1%3E"
+        );
+        post(&mut p, "/settings", &cookie, form.as_bytes());
+        assert_eq!(
+            p.settings.temp_sensors.as_slice(),
+            std::slice::from_ref(&named)
+        );
+        let form = std::format!("{base}&sensor=AA%3ABB%3ACC%3ADD%3AEE%3AFF");
+        post(&mut p, "/settings", &cookie, form.as_bytes());
+        assert_eq!(
+            p.settings.temp_sensors.as_slice(),
+            std::slice::from_ref(&named)
+        );
+        assert!(
+            get(&mut p, "/settings", &cookie)
+                .text()
+                .contains("name=nm_AABBCCDDEEFF value=\"Landing &lt;1&gt;\"")
+        );
+        assert!(
+            get(&mut p, "/", &cookie)
+                .text()
+                .contains("<b>Landing &lt;1&gt;</b> <code>AA:BB:CC:DD:EE:FF</code>")
+        );
+        let form = std::format!(
+            "{base}&sensor=AA%3ABB%3ACC%3ADD%3AEE%3AFF&nm_AABBCCDDEEFF={}",
+            "x".repeat(17)
+        );
+        assert!(
+            post(&mut p, "/settings", &cookie, form.as_bytes())
+                .text()
+                .contains("at most 16 characters")
+        );
+        // Clearing the name.
+        let form = std::format!("{base}&sensor=AA%3ABB%3ACC%3ADD%3AEE%3AFF&nm_AABBCCDDEEFF=");
+        post(&mut p, "/settings", &cookie, form.as_bytes());
+        assert_eq!(p.settings.temp_sensors.as_slice(), &[sensor(185)]);
 
         // A selected sensor that is out of range stays listed (and selected).
         p.ble = Some(crate::ble::BleTable::new());

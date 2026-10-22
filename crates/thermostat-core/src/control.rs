@@ -338,6 +338,7 @@ mod tests {
         TempSensor {
             addr: [id; 6],
             setpoint_dc,
+            name: Default::default(),
         }
     }
 

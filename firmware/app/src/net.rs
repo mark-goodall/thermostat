@@ -12,8 +12,8 @@ compile_error!("enable one of the `qemu` (emulator) or `wifi` (hardware) feature
 
 pub use imp::{Peripherals, start};
 
-/// DHCP client/server, DNS, 2 web connections, mDNS, SNTP, zone client, plus headroom.
-const SOCKETS: usize = 10;
+/// DHCP client/server, DNS, web connections, mDNS, SNTP, zone client, plus headroom.
+const SOCKETS: usize = 8 + crate::web::TASKS;
 
 fn resources() -> &'static mut StackResources<SOCKETS> {
     static RES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();

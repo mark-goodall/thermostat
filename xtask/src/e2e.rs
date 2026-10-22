@@ -577,6 +577,7 @@ fn zone_flash(
         temp_sensors: heapless::Vec::from_slice(&[thermostat_core::settings::TempSensor {
             addr: sensor,
             setpoint_dc: 210,
+            name: thermostat_core::settings::SensorName::try_from(name).unwrap(),
         }])
         .unwrap(),
         // Unique id: the emulated zones can reach the real LAN through QEMU's

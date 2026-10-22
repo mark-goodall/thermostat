@@ -65,7 +65,10 @@ A change takes effect after a reboot.
 ## Heating control
 
 - **Sensors.** On the settings page, check up to 4 BLE temperature sensors and
-  give each its own setpoint (5.0–35.0 °C). The page lists sensors currently
+  give each its own setpoint (5.0–35.0 °C) and, optionally, a name of up to 16
+  characters (e.g. "Landing"). The name is shown on the thermostat's pages, in
+  `/api/status` and in the log. The sensor's own advertised name (e.g.
+  `TP357 (2142)`) is fixed in its firmware and stays as it is. The page lists sensors currently
   heard that report a temperature, plus any already selected. A newly checked
   sensor starts at the default setpoint. Only readings newer than 10 minutes
   count.

@@ -62,13 +62,20 @@ pub fn str48(s: &str) -> Str48 {
 
 pub const MAX_TEMP_SENSORS: usize = 4;
 
+/// Longest sensor name, in bytes.
+pub const MAX_SENSOR_NAME: usize = 16;
+pub type SensorName = String<MAX_SENSOR_NAME>;
+
 /// A temperature sensor selected to control the heating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TempSensor {
     /// BLE address in on-air byte order.
     pub addr: [u8; 6],
     /// Target temperature for this sensor's room, tenths of °C.
     pub setpoint_dc: i16,
+    /// Our name for it (e.g. "Landing"); empty = none. The sensor's own
+    /// advertised name cannot be changed.
+    pub name: SensorName,
 }
 
 impl Settings {
@@ -131,6 +138,8 @@ mod tag {
     /// One i16 per entry of TEMP_SENSORS, same order. Settings written before
     /// per-sensor setpoints lack it; those sensors take SETPOINT.
     pub const SENSOR_SETPOINTS: u8 = 14;
+    /// Per entry of TEMP_SENSORS, same order: a length byte and the UTF-8 name.
+    pub const SENSOR_NAMES: u8 = 15;
 }
 
 struct Writer<'a> {
@@ -182,6 +191,16 @@ impl Settings {
             let n = self.temp_sensors.len();
             w.field(tag::TEMP_SENSORS, &addrs[..n * 6]);
             w.field(tag::SENSOR_SETPOINTS, &setpoints[..n * 2]);
+            if self.temp_sensors.iter().any(|t| !t.name.is_empty()) {
+                let mut names = [0u8; (1 + MAX_SENSOR_NAME) * MAX_TEMP_SENSORS];
+                let mut len = 0;
+                for t in &self.temp_sensors {
+                    names[len] = t.name.len() as u8;
+                    names[len + 1..len + 1 + t.name.len()].copy_from_slice(t.name.as_bytes());
+                    len += 1 + t.name.len();
+                }
+                w.field(tag::SENSOR_NAMES, &names[..len]);
+            }
         }
         w.pos
     }
@@ -189,6 +208,7 @@ impl Settings {
     pub fn decode(mut data: &[u8]) -> Result<Self, DecodeError> {
         let mut s = Settings::default();
         let mut setpoints: Option<&[u8]> = None;
+        let mut names: &[u8] = &[];
         while !data.is_empty() {
             if data.len() < 3 {
                 return Err(DecodeError::Truncated);
@@ -242,6 +262,7 @@ impl Settings {
                         let _ = s.temp_sensors.push(TempSensor {
                             addr: *a,
                             setpoint_dc: i16::MIN, // filled in below
+                            name: SensorName::new(),
                         });
                     }
                 }
@@ -251,6 +272,7 @@ impl Settings {
                     }
                     setpoints = Some(v);
                 }
+                tag::SENSOR_NAMES => names = v,
                 _ => {} // from a newer firmware; ignore
             }
         }
@@ -259,6 +281,14 @@ impl Settings {
             t.setpoint_dc = setpoints
                 .get(i)
                 .map_or(s.setpoint_dc, |b| i16::from_le_bytes(*b));
+            if let Some((&len, rest)) = names.split_first() {
+                let name = rest.get(..len as usize).ok_or(DecodeError::Truncated)?;
+                t.name = core::str::from_utf8(name)
+                    .ok()
+                    .and_then(|n| SensorName::try_from(n).ok())
+                    .ok_or(DecodeError::BadValue)?;
+                names = &rest[len as usize..];
+            }
         }
         Ok(s)
     }
@@ -292,10 +322,12 @@ mod tests {
                 TempSensor {
                     addr: [1, 2, 3, 4, 5, 6],
                     setpoint_dc: 215,
+                    name: SensorName::try_from("Landing").unwrap(),
                 },
                 TempSensor {
                     addr: [9; 6],
                     setpoint_dc: -40,
+                    name: SensorName::new(),
                 },
             ])
             .unwrap(),
@@ -339,11 +371,13 @@ mod tests {
             &[
                 TempSensor {
                     addr: [1; 6],
-                    setpoint_dc: 195
+                    setpoint_dc: 195,
+                    name: SensorName::new(),
                 },
                 TempSensor {
                     addr: [2; 6],
-                    setpoint_dc: 195
+                    setpoint_dc: 195,
+                    name: SensorName::new(),
                 }
             ]
         );
@@ -356,13 +390,15 @@ mod tests {
             hostname: str32(&"h".repeat(40)),
             wifi_ssid: str32(&"s".repeat(40)),
             admin_user: str32(&"u".repeat(40)),
-            temp_sensors: Vec::from_slice(
-                &[TempSensor {
+            temp_sensors: core::iter::repeat_n(
+                TempSensor {
                     addr: [0xAA; 6],
                     setpoint_dc: 0,
-                }; MAX_TEMP_SENSORS],
+                    name: SensorName::try_from("n".repeat(MAX_SENSOR_NAME).as_str()).unwrap(),
+                },
+                MAX_TEMP_SENSORS,
             )
-            .unwrap(),
+            .collect(),
             ntp_server: str48(&"n".repeat(48)),
             heater_id: str32(&"h".repeat(32)),
             group_key: str32(&"k".repeat(32)),
@@ -376,6 +412,8 @@ mod tests {
             ..Settings::default()
         };
         let mut buf = [0u8; MAX_ENCODED];
-        assert!(s.encode(&mut buf) <= MAX_ENCODED);
+        let n = s.encode(&mut buf);
+        assert!(n <= MAX_ENCODED);
+        assert_eq!(Settings::decode(&buf[..n]).unwrap(), s);
     }
 }

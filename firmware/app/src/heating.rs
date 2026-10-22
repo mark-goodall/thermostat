@@ -27,7 +27,7 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
     let mut last_request = None;
     loop {
         let now = Instant::now().as_millis();
-        let (heat, request, room, reason, grouped) = dev.with(|d| {
+        let (heat, request, temps, reason, grouped) = dev.with(|d| {
             let room = readings(&d.ble, &d.settings.temp_sensors, now);
             d.readings = room.clone();
             let min_on_ms = d.settings.min_on_min as u64 * 60_000;
@@ -54,7 +54,25 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
                 d.group.note_heater_on(now_unix);
             }
             let request = (d.thermostat.requesting(), d.thermostat.release_pending());
-            (heat, request, room, d.thermostat.reason.as_str(), grouped)
+            // e.g. "; Landing 19.0/21.0 °C, Bedroom 18.6/18.0 °C"
+            let mut temps = heapless::String::<160>::new();
+            for r in &room {
+                let sep = if temps.is_empty() { "; " } else { ", " };
+                let name = d
+                    .settings
+                    .temp_sensor(&r.addr)
+                    .map_or("", |t| t.name.as_str());
+                let _ = core::fmt::write(
+                    &mut temps,
+                    format_args!(
+                        "{sep}{name}{}{}/{} °C",
+                        if name.is_empty() { "" } else { " " },
+                        Tenths(cc_to_dc(r.temperature_cc) as i32),
+                        Tenths(r.setpoint_dc as i32)
+                    ),
+                );
+            }
+            (heat, request, temps, d.thermostat.reason.as_str(), grouped)
         });
         if heat {
             output.set_high();
@@ -68,19 +86,6 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
             last_request = Some(request);
         }
         if last != Some(heat) {
-            // e.g. "heating ON (a sensor is below its setpoint; 19.0/21.0 °C, 18.6/18.0 °C)"
-            let mut temps = heapless::String::<96>::new();
-            for r in &room {
-                let sep = if temps.is_empty() { "; " } else { ", " };
-                let _ = core::fmt::write(
-                    &mut temps,
-                    format_args!(
-                        "{sep}{}/{} °C",
-                        Tenths(cc_to_dc(r.temperature_cc) as i32),
-                        Tenths(r.setpoint_dc as i32)
-                    ),
-                );
-            }
             log::info!(
                 "heating {} ({reason}{temps})",
                 if heat { "ON" } else { "off" }
