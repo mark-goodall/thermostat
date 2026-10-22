@@ -1,20 +1,21 @@
 //! Multi-zone heating: thermostats that share one heater ("heater id").
 //!
 //! Every thermostat (zone) decides on its own whether it wants heat. The heater
-//! runs while any zone in the group requests heat, so short-cycle protection
-//! applies to *heater* transitions only: the first zone switching on or the
-//! last one switching off. Zones tell each other their state with small
-//! signed messages (`POST /api/zone/event`):
+//! runs while any zone in the group requests heat. Short-cycle protection is a
+//! minimum heater *on* time: a zone requesting heat always gets it at once, and
+//! only the last zone switching off has to wait until the heater has run for
+//! the minimum time since it started. Zones tell each other their state with
+//! small signed messages (`POST /api/zone/event`):
 //!
 //! ```text
-//! v=1&heater=boiler&zone=kitchen&heat=1&last=1792613236&ts=1792613300&sig=<hex>
+//! v=1&heater=boiler&zone=kitchen&heat=1&on=1792613236&ts=1792613300&sig=<hex>
 //! ```
 //!
-//! `last` is the Unix time of the most recent heater transition the sender
-//! knows of (0 = unknown), so all zones converge on the latest one and share
-//! one short-cycle timer. `ts` is the sender's clock (replay protection when
-//! both sides have NTP time). `sig` is HMAC-SHA256 over everything before
-//! `&sig=`, keyed with the group key, and required when a key is configured.
+//! `on` is the Unix time the heater last started, as far as the sender knows
+//! (0 = unknown); zones keep the latest, so all of them time the same run.
+//! `ts` is the sender's clock (replay protection when both sides have NTP
+//! time). `sig` is HMAC-SHA256 over everything before `&sig=`, keyed with the
+//! group key, and required when a key is configured.
 
 use core::fmt::Write as _;
 
@@ -40,8 +41,8 @@ pub struct ZoneMessage {
     pub heater: Name,
     pub zone: Name,
     pub heat: bool,
-    /// Latest heater transition known to the sender (Unix seconds).
-    pub last_switch: Option<i64>,
+    /// When the heater last started, as known to the sender (Unix seconds).
+    pub heater_on_since: Option<i64>,
     /// Sender's clock (Unix seconds), if synchronised.
     pub ts: Option<i64>,
 }
@@ -99,9 +100,9 @@ impl ZoneMessage {
         push_encoded(&mut s, &self.zone);
         let _ = write!(
             s,
-            "&heat={}&last={}&ts={}",
+            "&heat={}&on={}&ts={}",
             self.heat as u8,
-            self.last_switch.unwrap_or(0),
+            self.heater_on_since.unwrap_or(0),
             self.ts.unwrap_or(0)
         );
         if !key.is_empty() {
@@ -143,7 +144,7 @@ impl ZoneMessage {
                 Some("0") => false,
                 _ => return Err(ZoneError::Malformed),
             },
-            last_switch: Some(num("last")?).filter(|t| *t > 0),
+            heater_on_since: Some(num("on")?).filter(|t| *t > 0),
             ts: Some(num("ts")?).filter(|t| *t > 0),
         };
         if msg.zone.is_empty() {
@@ -188,8 +189,8 @@ pub struct Peer {
 #[derive(Debug, Default)]
 pub struct Group {
     peers: Vec<Peer, MAX_PEERS>,
-    /// Latest heater transition known in the group (Unix seconds).
-    pub last_switch: Option<i64>,
+    /// When the heater last started, latest known in the group (Unix seconds).
+    pub heater_on_since: Option<i64>,
     pub rejected: u32,
 }
 
@@ -197,7 +198,7 @@ impl Group {
     pub const fn new() -> Self {
         Self {
             peers: Vec::new(),
-            last_switch: None,
+            heater_on_since: None,
             rejected: 0,
         }
     }
@@ -243,7 +244,7 @@ impl Group {
             p.heat = msg.heat;
             p.heard_ms = Some(now_ms);
         }
-        self.note_switch(msg.last_switch);
+        self.note_heater_on(msg.heater_on_since);
     }
 
     /// Record a peer found through mDNS.
@@ -254,10 +255,10 @@ impl Group {
         }
     }
 
-    /// Keep the most recent heater transition time.
-    pub fn note_switch(&mut self, unix: Option<i64>) {
+    /// Keep the most recent heater start time.
+    pub fn note_heater_on(&mut self, unix: Option<i64>) {
         if let Some(t) = unix {
-            self.last_switch = Some(self.last_switch.map_or(t, |l| l.max(t)));
+            self.heater_on_since = Some(self.heater_on_since.map_or(t, |l| l.max(t)));
         }
     }
 
@@ -292,7 +293,7 @@ impl Group {
 
     pub fn clear(&mut self) {
         self.peers.clear();
-        self.last_switch = None;
+        self.heater_on_since = None;
     }
 }
 
@@ -306,7 +307,7 @@ mod tests {
             heater: str32("boiler"),
             zone: str32(zone),
             heat,
-            last_switch: last,
+            heater_on_since: last,
             ts,
         }
     }
@@ -317,7 +318,7 @@ mod tests {
         let body = m.encode("s3cret");
         assert!(
             body.starts_with(
-                "v=1&heater=boiler&zone=Kitchen%201&heat=1&last=1792600000&ts=1792613300&sig="
+                "v=1&heater=boiler&zone=Kitchen%201&heat=1&on=1792600000&ts=1792613300&sig="
             ),
             "{body}"
         );
@@ -328,12 +329,12 @@ mod tests {
         let plain = msg("hall", false, None, None).encode("");
         assert_eq!(
             plain.as_str(),
-            "v=1&heater=boiler&zone=hall&heat=0&last=0&ts=0"
+            "v=1&heater=boiler&zone=hall&heat=0&on=0&ts=0"
         );
         assert_eq!(
             ZoneMessage::decode(&plain, "boiler", "bedroom", "", None)
                 .unwrap()
-                .last_switch,
+                .heater_on_since,
             None
         );
     }
@@ -384,7 +385,7 @@ mod tests {
         );
         assert_eq!(
             d(
-                "v=1&heater=boiler&zone=a&heat=2&last=0&ts=0",
+                "v=1&heater=boiler&zone=a&heat=2&on=0&ts=0",
                 "boiler",
                 "x",
                 "",
@@ -406,7 +407,7 @@ mod tests {
         g.receive(&msg("kitchen", true, Some(500), None), 1_000);
         assert!(g.others_heating(1_000));
         g.receive(&msg("hall", false, Some(400), None), 1_000);
-        assert_eq!(g.last_switch, Some(500), "latest wins");
+        assert_eq!(g.heater_on_since, Some(500), "latest wins");
         // Silence counts as not heating.
         assert!(!g.others_heating(1_000 + PEER_TIMEOUT_MS));
         g.receive(&msg("kitchen", false, None, None), 2_000);

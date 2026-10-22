@@ -87,8 +87,8 @@ pub async fn handle<S: Read + Write, P: Platform>(
                     }
                     write!(
                         w,
-                        ",\"sensors_used\":{},\"heating\":{},\"heating_reason\":\"{}\",\"min_switch_min\":{}",
-                        st.sensors_used, st.heating, st.heating_reason, s.min_switch_min
+                        ",\"sensors_used\":{},\"heating\":{},\"heating_reason\":\"{}\",\"min_on_min\":{}",
+                        st.sensors_used, st.heating, st.heating_reason, s.min_on_min
                     )?;
                     match st.hold_remaining_s {
                         Some(r) => write!(w, ",\"hold_remaining_s\":{r}")?,
@@ -480,14 +480,14 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
             s.group_key = key;
         }
     }
-    if let Some(raw) = http::form_value(form, "min_switch") {
+    if let Some(raw) = http::form_value(form, "min_on") {
         let v: String<8> = http::url_decode(raw).ok_or("Invalid minimum switch time.")?;
-        s.min_switch_min = v
+        s.min_on_min = v
             .trim()
             .parse::<u16>()
             .ok()
-            .filter(|m| *m <= crate::control::MAX_MIN_SWITCH_MIN)
-            .ok_or("Minimum time between switches must be 0 to 1440 minutes.")?;
+            .filter(|m| *m <= crate::control::MAX_MIN_ON_MIN)
+            .ok_or("Minimum on time must be 0 to 1440 minutes.")?;
     }
     if let Some(raw) = http::form_value(form, "ntp_server") {
         let server: String<48> = http::url_decode(raw).ok_or("NTP server is too long.")?;
@@ -763,7 +763,7 @@ fn status_page(
     )?;
     if let Some(r) = st.hold_remaining_s {
         let m = r.div_ceil(60);
-        write!(w, ", {} h {:02} min left", m / 60, m % 60)?;
+        write!(w, ", {} h {:02} min to go", m / 60, m % 60)?;
     }
     w.write_str(")</small></td></tr>")?;
     if let Some(z) = zone {
@@ -913,14 +913,14 @@ fn settings_form(
 </fieldset><fieldset><legend>Thermostat</legend>\
 <label>Setpoint (°C)<input name=setpoint value=\"{}\" inputmode=decimal></label>\
 <label>Hysteresis (°C): on at setpoint − half, off at setpoint + half<input name=hysteresis value=\"{}\" inputmode=decimal></label>\
-<label>Minimum time between heating switches (minutes, 0 = off, default 240 = 4 h)\
-<input name=min_switch value=\"{}\" inputmode=numeric></label>\
+<label>Minimum heater on time (minutes, 0 = off, default 240 = 4 h). Never delays heating; once on, the heater runs at least this long\
+<input name=min_on value=\"{}\" inputmode=numeric></label>\
 </fieldset><fieldset><legend>Time</legend>\
 <label>NTP server (host or host:port)<input name=ntp_server value=\"{}\" maxlength=48 required></label>\
 <label>Timezone (POSIX TZ, e.g. GMT0BST,M3.5.0/1,M10.5.0 · CET-1CEST,M3.5.0,M10.5.0/3 · EST5EDT,M3.2.0,M11.1.0 · UTC0)\
 <input name=timezone value=\"{}\" maxlength=48 required></label></fieldset>\
 <fieldset><legend>Heater group</legend><p><small>Thermostats with the same heater id share one heater: \
-it runs while any zone requests heat, and the short-cycle protection applies to the heater as a whole. \
+it runs while any zone requests heat, and the minimum on time applies to the heater as a whole. \
 Leave empty if this thermostat has its own heater.</small></p>\
 <label>Heater id<input name=heater_id value=\"{}\" maxlength=32></label>\
 <label>Group key (same on every zone; signs zone messages){}<input type=password name=group_key maxlength=32 autocomplete=new-password></label>\
@@ -934,7 +934,7 @@ Leave empty if this thermostat has its own heater.</small></p>\
         },
         Tenths(s.setpoint_dc as i32),
         Tenths(s.hysteresis_dc as i32),
-        s.min_switch_min,
+        s.min_on_min,
         Escape(&s.ntp_server),
         Escape(&s.timezone),
         Escape(&s.heater_id),
@@ -965,12 +965,12 @@ fn own_zone_message<P: Platform>(p: &mut P) -> Option<crate::zones::ZoneMessage>
         return None;
     }
     let st = p.status();
-    let last_switch = p.zones(|g| g.last_switch);
+    let heater_on_since = p.zones(|g| g.heater_on_since);
     Some(crate::zones::ZoneMessage {
         heater: s.heater_id,
         zone: s.hostname,
         heat: st.heating,
-        last_switch,
+        heater_on_since,
         ts: st.unix_time,
     })
 }
@@ -985,7 +985,7 @@ type ZonePeerRow = (
 );
 struct ZoneSnapshot {
     peers: heapless::Vec<ZonePeerRow, { crate::zones::MAX_PEERS }>,
-    last_switch: Option<i64>,
+    heater_on_since: Option<i64>,
     rejected: u32,
 }
 
@@ -1003,7 +1003,7 @@ fn zone_snapshot<P: Platform>(p: &mut P, now: u64) -> ZoneSnapshot {
         }
         ZoneSnapshot {
             peers,
-            last_switch: g.last_switch,
+            heater_on_since: g.heater_on_since,
             rejected: g.rejected,
         }
     })
@@ -1034,8 +1034,8 @@ fn zone_json(
     json_str(w, &own.heater)?;
     w.write_str(",\"zone\":")?;
     json_str(w, &own.zone)?;
-    write!(w, ",\"heat\":{},\"last_switch\":", own.heat)?;
-    match z.last_switch {
+    write!(w, ",\"heat\":{},\"heater_on_since\":", own.heat)?;
+    match z.heater_on_since {
         Some(t) => write!(w, "{t}")?,
         None => w.write_str("null")?,
     }
@@ -1786,44 +1786,42 @@ mod tests {
     #[test]
     fn short_cycle_setting() {
         let (mut p, cookie) = provisioned();
-        assert_eq!(p.settings.min_switch_min, 240, "default is 4 hours");
+        assert_eq!(p.settings.min_on_min, 240, "default is 4 hours");
         let html = get(&mut p, "/settings", &cookie).text();
-        assert!(html.contains("name=min_switch value=\"240\""), "{html}");
+        assert!(html.contains("name=min_on value=\"240\""), "{html}");
         let base = "hostname=t&ssid=&setpoint=20.0&hysteresis=1.5";
         assert!(
             post(
                 &mut p,
                 "/settings",
                 &cookie,
-                std::format!("{base}&min_switch=90").as_bytes()
+                std::format!("{base}&min_on=90").as_bytes()
             )
             .text()
             .contains("Saved")
         );
-        assert_eq!(
-            (p.settings.min_switch_min, p.settings.hysteresis_dc),
-            (90, 15)
-        );
+        assert_eq!((p.settings.min_on_min, p.settings.hysteresis_dc), (90, 15));
         for bad in ["1441", "-5", "abc"] {
             let r = post(
                 &mut p,
                 "/settings",
                 &cookie,
-                std::format!("{base}&min_switch={bad}").as_bytes(),
+                std::format!("{base}&min_on={bad}").as_bytes(),
             );
             assert!(r.text().contains("0 to 1440"), "{bad}");
         }
         post(&mut p, "/settings", &cookie, base.as_bytes());
-        assert_eq!(
-            p.settings.min_switch_min, 90,
-            "omitted field keeps the value"
-        );
+        assert_eq!(p.settings.min_on_min, 90, "omitted field keeps the value");
 
         p.hold = Some(83 * 60 + 10);
-        assert!(get(&mut p, "/", &cookie).text().contains("1 h 24 min left"));
+        assert!(
+            get(&mut p, "/", &cookie)
+                .text()
+                .contains("1 h 24 min to go")
+        );
         let json = get(&mut p, "/api/status", "").text();
         assert!(
-            json.contains("\"min_switch_min\":90") && json.contains("\"hold_remaining_s\":4990"),
+            json.contains("\"min_on_min\":90") && json.contains("\"hold_remaining_s\":4990"),
             "{json}"
         );
     }
@@ -1882,7 +1880,7 @@ mod tests {
             heater: crate::settings::str32("boiler"),
             zone: crate::settings::str32("kitchen"),
             heat: true,
-            last_switch: Some(1_799_990_000),
+            heater_on_since: Some(1_799_990_000),
             ts: Some(1_800_000_000),
         };
         let r = post(
@@ -1902,7 +1900,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            (reply.zone.as_str(), reply.heat, reply.last_switch),
+            (reply.zone.as_str(), reply.heat, reply.heater_on_since),
             ("bedroom", false, Some(1_799_990_000))
         );
         assert!(p.group.others_heating(1000));
@@ -1919,7 +1917,7 @@ mod tests {
         assert_eq!(p.group.rejected, 1);
 
         let json = get(&mut p, "/api/zone", "").text();
-        assert!(json.starts_with("{\"heater\":\"boiler\",\"zone\":\"bedroom\",\"heat\":false,\"last_switch\":1799990000,\"rejected\":1,\"peers\":[{\"zone\":\"kitchen\",\"addr\":null,\"heat\":true,\"active\":true"), "{json}");
+        assert!(json.starts_with("{\"heater\":\"boiler\",\"zone\":\"bedroom\",\"heat\":false,\"heater_on_since\":1799990000,\"rejected\":1,\"peers\":[{\"zone\":\"kitchen\",\"addr\":null,\"heat\":true,\"active\":true"), "{json}");
         assert!(
             get(&mut p, "/", &cookie)
                 .text()

@@ -32,8 +32,8 @@ pub struct Settings {
     pub setpoint_dc: i16,
     /// Switching hysteresis in tenths of a degree Celsius.
     pub hysteresis_dc: u16,
-    /// Minimum minutes between heating switches (short-cycle protection).
-    pub min_switch_min: u16,
+    /// Minimum heater on time in minutes (short-cycle protection).
+    pub min_on_min: u16,
     /// BLE sensors (addresses in on-air byte order) whose readings drive the thermostat.
     pub temp_sensors: Vec<[u8; 6], MAX_TEMP_SENSORS>,
     /// Heater group: thermostats with the same id share one heater and its
@@ -71,7 +71,7 @@ impl Default for Settings {
             admin_hash: None,
             setpoint_dc: 200,
             hysteresis_dc: 5,
-            min_switch_min: crate::control::DEFAULT_MIN_SWITCH_MIN,
+            min_on_min: crate::control::DEFAULT_MIN_ON_MIN,
             temp_sensors: Vec::new(),
             heater_id: String::new(),
             group_key: String::new(),
@@ -108,7 +108,7 @@ mod tag {
     pub const TEMP_SENSORS: u8 = 8;
     pub const NTP_SERVER: u8 = 9;
     pub const TIMEZONE: u8 = 10;
-    pub const MIN_SWITCH: u8 = 11;
+    pub const MIN_ON: u8 = 11;
     pub const HEATER_ID: u8 = 12;
     pub const GROUP_KEY: u8 = 13;
 }
@@ -143,7 +143,7 @@ impl Settings {
         }
         w.field(tag::SETPOINT, &self.setpoint_dc.to_le_bytes());
         w.field(tag::HYSTERESIS, &self.hysteresis_dc.to_le_bytes());
-        w.field(tag::MIN_SWITCH, &self.min_switch_min.to_le_bytes());
+        w.field(tag::MIN_ON, &self.min_on_min.to_le_bytes());
         if !self.heater_id.is_empty() {
             w.field(tag::HEATER_ID, self.heater_id.as_bytes());
         }
@@ -200,8 +200,8 @@ impl Settings {
                     s.hysteresis_dc =
                         u16::from_le_bytes(v.try_into().map_err(|_| DecodeError::BadValue)?)
                 }
-                tag::MIN_SWITCH => {
-                    s.min_switch_min =
+                tag::MIN_ON => {
+                    s.min_on_min =
                         u16::from_le_bytes(v.try_into().map_err(|_| DecodeError::BadValue)?)
                 }
                 tag::HEATER_ID => s.heater_id = text()?,
@@ -250,7 +250,7 @@ mod tests {
             setpoint_dc: -15,
             temp_sensors: Vec::from_slice(&[[1, 2, 3, 4, 5, 6], [9; 6]]).unwrap(),
             ntp_server: str48("10.0.2.2:12345"),
-            min_switch_min: 90,
+            min_on_min: 90,
             heater_id: str32("boiler"),
             group_key: str32("secret"),
             timezone: str48("GMT0BST,M3.5.0/1,M10.5.0"),

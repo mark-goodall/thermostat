@@ -567,7 +567,7 @@ fn zone_flash(
         )),
         setpoint_dc: 210,
         hysteresis_dc: 4,
-        min_switch_min: 2,
+        min_on_min: 2,
         temp_sensors: heapless::Vec::from_slice(&[sensor]).unwrap(),
         // Unique id: the emulated zones can reach the real LAN through QEMU's
         // NAT (including mDNS), so avoid joining a real heater group.
@@ -875,7 +875,7 @@ pub fn run_zones(dir: &Path, base_flash: &Path, sntp_port: u16) -> Result<()> {
     })?;
 
     step(
-        "zone B is last: held until 2 min after the heater started",
+        "zone B is last: heater kept on until 2 min after it started",
         || {
             // Make sure B has heard that A stopped before it decides.
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -884,7 +884,7 @@ pub fn run_zones(dir: &Path, base_flash: &Path, sntp_port: u16) -> Result<()> {
                 std::thread::sleep(Duration::from_secs(1));
             }
             inject(&b, &basic, sensor_b, "23.0")?;
-            let s = b.wait_status("B holding", Duration::from_secs(30), |s| {
+            let s = b.wait_status("B kept on", Duration::from_secs(30), |s| {
                 s["hold_remaining_s"].as_u64().is_some()
             })?;
             anyhow::ensure!(heating(&s), "B must keep the heater on while held: {s}");
@@ -896,28 +896,37 @@ pub fn run_zones(dir: &Path, base_flash: &Path, sntp_port: u16) -> Result<()> {
     )?;
 
     step(
-        "zone A must wait for the shared timer (B just stopped the heater)",
+        "zone A heats at once right after the heater stopped (no delay on starting)",
         || {
             let deadline = Instant::now() + Duration::from_secs(30);
             while peer_heat(&zone_status(&a)?, "zone-b") != Some(false) {
                 anyhow::ensure!(Instant::now() < deadline, "A never heard B stop");
                 std::thread::sleep(Duration::from_secs(1));
             }
+            let before = zone_status(&a)?["heater_on_since"].as_i64();
             inject(&a, &basic, sensor_a, "19.0")?;
-            let s = a.wait_status("A holding", Duration::from_secs(30), |s| {
-                s["hold_remaining_s"].as_u64().is_some()
-            })?;
-            let left = s["hold_remaining_s"].as_u64().unwrap();
+            let s = a.wait_status("A heating", Duration::from_secs(15), heating)?;
             anyhow::ensure!(
-                !heating(&s) && left > 60,
-                "A should be held off for most of 2 min: {s}"
+                s["hold_remaining_s"].is_null(),
+                "starting must never be held: {s}"
             );
-            let (za, zb) = (zone_status(&a)?, zone_status(&b)?);
-            anyhow::ensure!(
-                za["last_switch"] == zb["last_switch"],
-                "zones disagree on the last switch: {za} / {zb}"
-            );
-            Ok(())
+            // A started the heater: both zones learn the new start time.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let (za, zb) = (zone_status(&a)?, zone_status(&b)?);
+                let (on_a, on_b) = (
+                    za["heater_on_since"].as_i64(),
+                    zb["heater_on_since"].as_i64(),
+                );
+                if on_a.is_some() && on_a != before && on_a == on_b {
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "zones disagree on the heater start: {za} / {zb}"
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
         },
     )?;
     Ok(())

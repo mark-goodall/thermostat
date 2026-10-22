@@ -83,7 +83,7 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
                 heater: s.heater_id.clone(),
                 zone: s.hostname.clone(),
                 heat: d.thermostat.heating(),
-                last_switch: d.group.last_switch,
+                heater_on_since: d.group.heater_on_since,
                 ts: d.clock.unix_s(now.as_micros()),
             };
             let targets: Vec<([u8; 4], u16), MAX_PEERS> =

@@ -70,11 +70,13 @@ A change takes effect after a reboot.
   newer than 10 minutes.
 - **Hysteresis** (settings page, 0.1–5.0 °C). Heating turns on at or below
   `setpoint − hysteresis/2` and off at or above `setpoint + hysteresis/2`.
-- **Short-cycle protection** (settings page, minutes; default 240 = 4 h, 0
-  disables it, maximum 1440). Switches are at least this far apart; the
-  status page shows the time left while a switch is held back. The first
-  switch after boot is immediate, since the interval is not persisted across
-  reboots.
+- **Short-cycle protection = minimum heater on time** (settings page,
+  minutes; default 240 = 4 h, 0 disables it, maximum 1440).
+  - A request for heat is never delayed.
+  - Once the heater is on, it keeps running until it has been on this long,
+    even if the room passes the off point. The status page shows the time
+    to go.
+  - The timer is not persisted across reboots.
 - **Heater group.** Zones sharing one heater coordinate as described in
   "Multiple zones on one heater".
 - **Fail-safe.** With no fresh reading from any selected sensor, or none
@@ -102,18 +104,19 @@ Thermostats with the same **heater id** (settings page, or `xtask provision
 --heater-id`) share one heater. Typically their outputs or zone valves are
 wired in parallel, so the heater runs while *any* zone requests heat.
 
-- **Short-cycle protection:** applies to heater transitions only. A zone
-  switching on while another zone already heats, or off while another keeps
-  heating, switches at once. The first zone on and the last zone off wait
-  for the shared interval since the latest heater transition in the group.
+- **Minimum on time:** applies to the heater as a whole.
+  - Any zone requesting heat gets it at once.
+  - A zone switching off while another still heats switches at once.
+  - The last zone switching off keeps the heater on until it has run for the
+    minimum time since it *started*, whichever zone started it.
 - **Discovery:** each zone advertises `heater=<id>` in its
   `_thermostat._tcp` mDNS TXT record, and browses for peers every minute.
 - **Events:** `POST /api/zone/event` with
-  `v=1&heater=…&zone=<hostname>&heat=0|1&last=<unix>&ts=<unix>&sig=<hex>`.
+  `v=1&heater=…&zone=<hostname>&heat=0|1&on=<unix>&ts=<unix>&sig=<hex>`.
   - Sent at once when a zone's request changes, and every 30 s as a keepalive.
   - The reply carries the receiver's own state.
-  - `last` is the latest heater transition the sender knows of. Zones keep
-    the maximum, so everyone shares one timer; this needs NTP.
+  - `on` is when the heater last started, as the sender knows it. Zones keep
+    the latest, so all of them time the same run; this needs NTP.
 - **Liveness:** a zone not heard from for 90 s no longer counts as
   requesting heat.
 - **Group key** (optional, same on all zones): messages are signed with
@@ -123,8 +126,8 @@ wired in parallel, so the heater runs while *any* zone requests heat.
   page lists the zones and whether each is heating, idle or silent.
 
 Known limit: if two zones decide to switch off within the same few seconds,
-each may still believe the other is heating, so the heater can stop slightly
-early.
+each may still believe the other is heating, so the heater can stop before
+its minimum on time.
 
 Tested in QEMU with two emulated zones behind a learning switch (`xtask
 test-qemu`), and on hardware against a second zone emulated by a Python

@@ -17,14 +17,14 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
         let (heat, room, reason, grouped) = dev.with(|d| {
             let room = room_temperature(&d.ble, &d.settings.temp_sensors, now);
             d.room = room;
-            let min_switch_ms = d.settings.min_switch_min as u64 * 60_000;
+            let min_on_ms = d.settings.min_on_min as u64 * 60_000;
             let now_unix = d.clock.unix_s(Instant::now().as_micros());
             let grouped = !d.settings.heater_id.is_empty();
             let group = if grouped {
                 GroupState {
                     others_heating: d.group.others_heating(now),
-                    // The group shares heater transitions as Unix time; map to our clock.
-                    last_heater_switch_ms: match (d.group.last_switch, now_unix) {
+                    // The group shares the heater start time as Unix time; map to our clock.
+                    heater_on_since_ms: match (d.group.heater_on_since, now_unix) {
                         (Some(last), Some(unix)) => {
                             Some(now.saturating_sub((unix - last).max(0) as u64 * 1000))
                         }
@@ -38,12 +38,12 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
                 room,
                 d.settings.setpoint_dc,
                 d.settings.hysteresis_dc,
-                min_switch_ms,
+                min_on_ms,
                 group,
                 now,
             );
-            if d.thermostat.take_heater_switch() {
-                d.group.note_switch(now_unix);
+            if d.thermostat.take_heater_started() {
+                d.group.note_heater_on(now_unix);
             }
             (heat, room, d.thermostat.reason.as_str(), grouped)
         });
