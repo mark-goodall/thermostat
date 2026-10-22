@@ -135,14 +135,16 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(mdns::task(stack, dev).unwrap());
     spawner.spawn(sntp::task(stack, dev).unwrap());
     spawner.spawn(zones::task(stack, dev).unwrap());
-    // Heat demand, active high. GPIO2 drives the on-board LED on many ESP32
-    // dev boards, so the state is visible until a relay driver is attached.
-    let heat_output = esp_hal::gpio::Output::new(
-        peripherals.GPIO2,
-        esp_hal::gpio::Level::Low,
-        esp_hal::gpio::OutputConfig::default(),
-    );
-    spawner.spawn(heating::task(heat_output, dev).unwrap());
+    // Board pins: zone relay on GPIO16 (active high), status LED on GPIO23.
+    let out = |pin: esp_hal::gpio::AnyPin<'static>| {
+        esp_hal::gpio::Output::new(
+            pin,
+            esp_hal::gpio::Level::Low,
+            esp_hal::gpio::OutputConfig::default(),
+        )
+    };
+    spawner.spawn(heating::task(out(peripherals.GPIO16.into()), dev).unwrap());
+    spawner.spawn(heating::led_task(out(peripherals.GPIO23.into())).unwrap());
     #[cfg(feature = "wifi")]
     spawner.spawn(ble::task(peripherals.BT, dev).unwrap());
     for _ in 0..web::TASKS {

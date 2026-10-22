@@ -1,5 +1,7 @@
 //! Heating control loop: room temperature from the selected BLE sensors,
-//! hysteresis decision, and the heat-demand output.
+//! hysteresis decision, the heat-demand output (zone relay) and the status LED.
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_futures::select::select;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -11,6 +13,9 @@ use thermostat_core::control::{GroupState, room_temperature};
 use crate::device::Handle;
 
 const PERIOD: Duration = Duration::from_secs(5);
+
+/// Whether the heat output is on, for the status LED.
+static HEAT_ON: AtomicBool = AtomicBool::new(false);
 
 /// Signalled when the group answered a release, to act on it at once.
 pub static RECHECK: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -60,6 +65,7 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
         } else {
             output.set_low();
         }
+        HEAT_ON.store(heat, Ordering::Relaxed);
         // Tell the group at once when our request changes or a release starts.
         if grouped && last_request != Some(request) {
             crate::zones::KICK.signal(());
@@ -79,5 +85,32 @@ pub async fn task(mut output: Output<'static>, dev: Handle) {
             last = Some(heat);
         }
         select(Timer::after(PERIOD), RECHECK.wait()).await;
+    }
+}
+
+/// Status LED: blinks at 1 Hz while heating, 0.2 Hz while not (50 % duty).
+#[embassy_executor::task]
+pub async fn led_task(mut led: Output<'static>) {
+    const TICK: Duration = Duration::from_millis(250);
+    let mut heat = false;
+    let mut ticks = 0u32;
+    loop {
+        let now = HEAT_ON.load(Ordering::Relaxed);
+        if now != heat {
+            // Start the new rate from the beginning of an "on" phase.
+            heat = now;
+            ticks = 0;
+        }
+        // Half periods in ticks: 500 ms (1 Hz) or 2.5 s (0.2 Hz).
+        let half = if heat { 2 } else { 10 };
+        if ticks % half == 0 {
+            if (ticks / half) % 2 == 0 {
+                led.set_high();
+            } else {
+                led.set_low();
+            }
+        }
+        ticks = ticks.wrapping_add(1);
+        Timer::after(TICK).await;
     }
 }

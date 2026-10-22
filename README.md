@@ -7,7 +7,7 @@ second-stage bootloader.
 Status: early but functional. Implemented so far are the bootloader, the update paths
 (HTTP and serial), the settings store with its web pages, and emulator-based
 testing. Heating is controlled from BLE temperature sensors (see "Heating control"),
-driving GPIO2 as a stand-in for a relay output.
+driving the zone relay on GPIO16, with a status LED on GPIO23.
 
 ## Layout
 
@@ -81,9 +81,9 @@ A change takes effect after a reboot.
   "Multiple zones on one heater".
 - **Fail-safe.** With no fresh reading from any selected sensor, or none
   selected, heating is off at once.
-- **Output.** Heat demand drives GPIO2, active high. That is the on-board LED on
-  many ESP32 dev boards; put a relay driver there (or change the pin in
-  `main.rs`).
+- **Output.** Heat demand drives the zone relay on GPIO16, active high. The
+  status LED on GPIO23 blinks at 1 Hz while the relay is on and 0.2 Hz while it
+  is off. Pins are set in `main.rs`.
 - **Status.** The status page and `/api/status` show the room temperature, the
   number of sensors used, the heating state and the reason (`below setpoint`,
   `within hysteresis band`, `keeping the heater on for its minimum on time`,
