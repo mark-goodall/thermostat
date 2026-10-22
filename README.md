@@ -183,6 +183,12 @@ no host stack is needed. `/ble` in the web UI (auto-refreshing) and
 - 16-bit service UUIDs, with names for common ones
 - packet count and when each was last seen
 
+The table holds 24 devices; one not heard for 15 minutes is dropped. Phones,
+laptops and trackers advertise from *private* random addresses that change every
+few minutes. These are ignored unless the advertisement carries a sensor reading;
+`/api/ble` counts them in `ignored_private`. Public and random *static* addresses
+(used by some sensors) are listed.
+
 Readings from supported thermometers (table above) are decoded into
 temperature, humidity and battery. Stock Xiaomi
 MiBeacon (`FE95`) payloads are encrypted and are not decoded.

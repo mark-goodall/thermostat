@@ -17,15 +17,22 @@ pub const EXPIRY_MS: u64 = 15 * 60 * 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrKind {
     Public,
-    Random,
+    /// Random static: fixed until the device is power-cycled (some sensors).
+    RandomStatic,
+    /// Resolvable or non-resolvable private address: changes every few
+    /// minutes (phones, laptops, trackers).
+    RandomPrivate,
     Other(u8),
 }
 
 impl AddrKind {
-    pub fn from_raw(v: u8) -> Self {
+    /// From the HCI address type and the address (on-air byte order). For random
+    /// addresses the top two bits tell static (`11`) from private.
+    pub fn from_raw(v: u8, addr: &[u8; 6]) -> Self {
         match v {
             0 | 2 => AddrKind::Public,
-            1 | 3 => AddrKind::Random,
+            1 | 3 if addr[5] >> 6 == 0b11 => AddrKind::RandomStatic,
+            1 | 3 => AddrKind::RandomPrivate,
             v => AddrKind::Other(v),
         }
     }
@@ -33,7 +40,8 @@ impl AddrKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             AddrKind::Public => "public",
-            AddrKind::Random => "random",
+            AddrKind::RandomStatic => "random static",
+            AddrKind::RandomPrivate => "random private",
             AddrKind::Other(_) => "other",
         }
     }
@@ -317,6 +325,9 @@ pub struct BleTable {
     devices: Vec<BleDevice, MAX_DEVICES>,
     /// Advertising reports processed since start.
     pub reports: u32,
+    /// Reports dropped because they came from a rotating private address and
+    /// carried no sensor reading (they would only fill the table).
+    pub ignored_private: u32,
     pub scanning: bool,
     pub error: Option<&'static str>,
 }
@@ -326,6 +337,7 @@ impl BleTable {
         Self {
             devices: Vec::new(),
             reports: 0,
+            ignored_private: 0,
             scanning: false,
             error: None,
         }
@@ -335,12 +347,25 @@ impl BleTable {
     pub fn observe(&mut self, addr: [u8; 6], addr_kind: u8, rssi: i8, data: &[u8], now_ms: u64) {
         self.reports = self.reports.wrapping_add(1);
         let info = parse_adv(data);
+        let addr_kind = AddrKind::from_raw(addr_kind, &addr);
+        // Rotating private addresses would fill the table with a new entry every
+        // few minutes per phone. Keep only those that broadcast a sensor reading.
+        if addr_kind == AddrKind::RandomPrivate
+            && info.sensor.is_none()
+            && !info
+                .manufacturer
+                .as_ref()
+                .is_some_and(|m| decode_thermopro(info.name.as_deref(), m).is_some())
+        {
+            self.ignored_private = self.ignored_private.wrapping_add(1);
+            return;
+        }
         let dev = match self.devices.iter().position(|d| d.addr == addr) {
             Some(i) => &mut self.devices[i],
             None => {
                 let fresh = BleDevice {
                     addr,
-                    addr_kind: AddrKind::from_raw(addr_kind),
+                    addr_kind,
                     rssi,
                     name: None,
                     company: None,
@@ -605,6 +630,29 @@ mod tests {
     }
 
     #[test]
+    fn rotating_private_addresses_are_dropped() {
+        let mut t = BleTable::new();
+        let apple = ad(0xFF, &[0x4C, 0x00, 0x10, 0x05]);
+        // Resolvable (top bits 01) and non-resolvable (00) private: dropped.
+        t.observe([1, 2, 3, 4, 5, 0x4D], 1, -60, &apple, 0);
+        t.observe([1, 2, 3, 4, 5, 0x1C], 1, -60, &apple, 0);
+        assert_eq!((t.len(), t.ignored_private, t.reports), (0, 2, 2));
+        // Random static (11) and public addresses are kept.
+        t.observe([1, 2, 3, 4, 5, 0xE2], 1, -60, &apple, 0);
+        t.observe([1, 2, 3, 4, 5, 0x1C], 0, -60, &apple, 0);
+        assert_eq!(t.len(), 2);
+        // A private address broadcasting a sensor reading is kept.
+        let mut pvvx = std::vec![18, 0x16, 0x1A, 0x18, 1, 2, 3, 4, 5, 6];
+        pvvx.extend_from_slice(&2000i16.to_le_bytes());
+        pvvx.extend_from_slice(&[0x88, 0x13, 0x86, 0x0B, 90, 1, 0]);
+        t.observe([9, 9, 9, 9, 9, 0x40], 1, -60, &pvvx, 0);
+        let d = t.get(&[9, 9, 9, 9, 9, 0x40]).unwrap();
+        assert_eq!(d.addr_kind, AddrKind::RandomPrivate);
+        assert!(d.sensor.is_some());
+        assert_eq!(t.ignored_private, 2);
+    }
+
+    #[test]
     fn table_merges_evicts_and_expires() {
         let mut t = BleTable::new();
         let a = [1, 0, 0, 0, 0, 0xAA];
@@ -618,14 +666,14 @@ mod tests {
         assert_eq!(d.addr_string().as_str(), "AA:00:00:00:00:01");
 
         for i in 0..MAX_DEVICES as u8 {
-            t.observe([2, 0, 0, 0, 0, i], 1, -90, &[], 100 + i as u64);
+            t.observe([2, 0, 0, 0, 0, 0xC0 | i], 1, -90, &[], 100 + i as u64);
         }
         assert_eq!(t.len(), MAX_DEVICES);
         assert!(
             t.sorted().iter().all(|d| d.addr != a),
             "least recently seen evicted"
         );
-        assert_eq!(t.sorted()[0].addr_kind, AddrKind::Random);
+        assert_eq!(t.sorted()[0].addr_kind, AddrKind::RandomStatic);
 
         t.expire(100 + EXPIRY_MS + 5);
         assert_eq!(t.len(), MAX_DEVICES - 6);

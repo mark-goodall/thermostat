@@ -279,7 +279,17 @@ pub async fn handle<S: Read + Write, P: Platform>(
         }
         (Method::Get, "/ble") => {
             let now = p.now_ms();
-            let snapshot = p.ble(|t| t.map(|t| (t.sorted(), t.reports, t.scanning, t.error)));
+            let snapshot = p.ble(|t| {
+                t.map(|t| {
+                    (
+                        t.sorted(),
+                        t.reports,
+                        t.scanning,
+                        t.error,
+                        t.ignored_private,
+                    )
+                })
+            });
             let s = p.settings();
             page(sock, page_buf, "Bluetooth", true, |w| {
                 ble_page(w, &s, snapshot.as_ref(), now)
@@ -288,7 +298,17 @@ pub async fn handle<S: Read + Write, P: Platform>(
         }
         (Method::Get, "/api/ble") => {
             let now = p.now_ms();
-            let snapshot = p.ble(|t| t.map(|t| (t.sorted(), t.reports, t.scanning, t.error)));
+            let snapshot = p.ble(|t| {
+                t.map(|t| {
+                    (
+                        t.sorted(),
+                        t.reports,
+                        t.scanning,
+                        t.error,
+                        t.ignored_private,
+                    )
+                })
+            });
             respond(sock, page_buf, 200, "application/json", &[], |w| {
                 ble_json(w, snapshot.as_ref(), now)
             })
@@ -1175,6 +1195,7 @@ type BleSnapshot = (
     u32,
     bool,
     Option<&'static str>,
+    u32,
 );
 
 fn sensor_text(w: &mut BufWriter<'_>, r: &crate::ble::SensorReading) -> core::fmt::Result {
@@ -1196,19 +1217,21 @@ fn ble_page(
     snap: Option<&BleSnapshot>,
     now: u64,
 ) -> core::fmt::Result {
-    let Some((devices, reports, scanning, error)) = snap else {
+    let Some((devices, reports, scanning, error, ignored)) = snap else {
         return w.write_str("<p>This build has no Bluetooth radio (emulator).</p>");
     };
     write!(
         w,
-        "<p>{} · {} devices · {} advertisements received. Refreshes every 5 s.</p>",
+        "<p>{} · {} devices · {} advertisements received, {} of them from rotating private addresses \
+(phones, laptops) and not listed. Refreshes every 5 s.</p>",
         if *scanning {
             "Passive scan running"
         } else {
             "Scanner not running"
         },
         devices.len(),
-        reports
+        reports,
+        ignored
     )?;
     if let Some(e) = error {
         write!(w, "<p class=err>{}</p>", Escape(e))?;
@@ -1259,12 +1282,12 @@ fn ble_page(
 }
 
 fn ble_json(w: &mut BufWriter<'_>, snap: Option<&BleSnapshot>, now: u64) -> core::fmt::Result {
-    let Some((devices, reports, scanning, _)) = snap else {
+    let Some((devices, reports, scanning, _, ignored)) = snap else {
         return w.write_str("{\"supported\":false}");
     };
     write!(
         w,
-        "{{\"supported\":true,\"scanning\":{scanning},\"reports\":{reports},\"devices\":["
+        "{{\"supported\":true,\"scanning\":{scanning},\"reports\":{reports},\"ignored_private\":{ignored},\"devices\":["
     )?;
     for (i, d) in devices.iter().enumerate() {
         write!(
@@ -1713,21 +1736,26 @@ mod tests {
         let mut phone = std::vec![4, 0xFF, 0x4C, 0x00, 0x10];
         phone.extend_from_slice(&[5, 0x09]);
         phone.extend_from_slice(b"<b\"x");
-        t.observe([9, 9, 9, 9, 9, 9], 1, -80, &phone, 900);
+        t.observe([9, 9, 9, 9, 9, 0xC9], 1, -80, &phone, 900); // random static
+        t.observe([7, 7, 7, 7, 7, 0x47], 1, -40, &phone, 950); // rotating private: dropped
         p.ble = Some(t);
 
         let html = get(&mut p, "/ble", &cookie).text();
         assert!(html.contains("2 devices"), "{html}");
+        assert!(html.contains("3 advertisements received, 1 of them from rotating private"));
+        assert!(!html.contains("47:07:07"));
         assert!(html.contains("01:02:03:04:05:06"));
         assert!(html.contains("21.3 °C") && html.contains("45.6 %") && html.contains("87%"));
         assert!(html.contains("Apple") && html.contains("&lt;b&quot;x") && !html.contains("<b\"x"));
         assert!(html.ends_with("</html>"));
         // Strongest signal first.
-        assert!(html.find("01:02:03:04:05:06").unwrap() < html.find("09:09:09:09:09:09").unwrap());
+        assert!(html.find("01:02:03:04:05:06").unwrap() < html.find("C9:09:09:09:09:09").unwrap());
 
         let json = get(&mut p, "/api/ble", &cookie).text();
         assert!(
-            json.starts_with("{\"supported\":true,\"scanning\":true,\"reports\":2,"),
+            json.starts_with(
+                "{\"supported\":true,\"scanning\":true,\"reports\":3,\"ignored_private\":1,"
+            ),
             "{json}"
         );
         assert!(json.contains("\"temperature\":21.3") && json.contains("\"battery\":87"));
