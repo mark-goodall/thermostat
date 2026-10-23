@@ -14,7 +14,7 @@ pub const SETTINGS_SUBTYPE: u8 = 0x40; // custom: thermostat settings
 pub const SETTINGS_LABEL: &str = "settings";
 
 /// Upper bound of an encoded [`Settings`].
-pub const MAX_ENCODED: usize = 512;
+pub const MAX_ENCODED: usize = 640;
 
 pub type Str32 = String<32>;
 
@@ -46,6 +46,8 @@ pub struct Settings {
     pub ntp_server: Str48,
     /// POSIX TZ string, e.g. `GMT0BST,M3.5.0/1,M10.5.0` (see `clock::TimeZone`).
     pub timezone: Str48,
+    /// Names of the heating zones (empty = "Zone 1", "Zone 2", ...).
+    pub zone_names: [ZoneName; MAX_ZONES],
 }
 
 pub type Str48 = String<48>;
@@ -76,7 +78,13 @@ pub struct TempSensor {
     /// Our name for it (e.g. "Landing"); empty = none. The sensor's own
     /// advertised name cannot be changed.
     pub name: SensorName,
+    /// Heating zone it belongs to (0-based; boards with one zone use 0).
+    pub zone: u8,
 }
+
+/// Heating zones a board can have (one relay each).
+pub const MAX_ZONES: usize = 2;
+pub type ZoneName = SensorName;
 
 impl Settings {
     /// The selected sensor with this address.
@@ -101,6 +109,7 @@ impl Default for Settings {
             group_key: String::new(),
             ntp_server: str48("pool.ntp.org"),
             timezone: str48("UTC0"),
+            zone_names: Default::default(),
         }
     }
 }
@@ -140,6 +149,10 @@ mod tag {
     pub const SENSOR_SETPOINTS: u8 = 14;
     /// Per entry of TEMP_SENSORS, same order: a length byte and the UTF-8 name.
     pub const SENSOR_NAMES: u8 = 15;
+    /// One byte per entry of TEMP_SENSORS, same order: its zone. Absent = zone 0.
+    pub const SENSOR_ZONES: u8 = 16;
+    /// Per zone: a length byte and the UTF-8 name.
+    pub const ZONE_NAMES: u8 = 17;
 }
 
 struct Writer<'a> {
@@ -201,6 +214,23 @@ impl Settings {
                 }
                 w.field(tag::SENSOR_NAMES, &names[..len]);
             }
+            if self.temp_sensors.iter().any(|t| t.zone != 0) {
+                let mut zones = [0u8; MAX_TEMP_SENSORS];
+                for (i, t) in self.temp_sensors.iter().enumerate() {
+                    zones[i] = t.zone;
+                }
+                w.field(tag::SENSOR_ZONES, &zones[..n]);
+            }
+        }
+        if self.zone_names.iter().any(|z| !z.is_empty()) {
+            let mut names = [0u8; (1 + MAX_SENSOR_NAME) * MAX_ZONES];
+            let mut len = 0;
+            for z in &self.zone_names {
+                names[len] = z.len() as u8;
+                names[len + 1..len + 1 + z.len()].copy_from_slice(z.as_bytes());
+                len += 1 + z.len();
+            }
+            w.field(tag::ZONE_NAMES, &names[..len]);
         }
         w.pos
     }
@@ -209,6 +239,7 @@ impl Settings {
         let mut s = Settings::default();
         let mut setpoints: Option<&[u8]> = None;
         let mut names: &[u8] = &[];
+        let mut zones: &[u8] = &[];
         while !data.is_empty() {
             if data.len() < 3 {
                 return Err(DecodeError::Truncated);
@@ -263,6 +294,7 @@ impl Settings {
                             addr: *a,
                             setpoint_dc: i16::MIN, // filled in below
                             name: SensorName::new(),
+                            zone: 0,
                         });
                     }
                 }
@@ -273,11 +305,31 @@ impl Settings {
                     setpoints = Some(v);
                 }
                 tag::SENSOR_NAMES => names = v,
+                tag::SENSOR_ZONES => zones = v,
+                tag::ZONE_NAMES => {
+                    let mut rest = v;
+                    for z in s.zone_names.iter_mut() {
+                        let Some((&len, r)) = rest.split_first() else {
+                            break;
+                        };
+                        let name = r.get(..len as usize).ok_or(DecodeError::Truncated)?;
+                        *z = core::str::from_utf8(name)
+                            .ok()
+                            .and_then(|n| ZoneName::try_from(n).ok())
+                            .ok_or(DecodeError::BadValue)?;
+                        rest = &r[len as usize..];
+                    }
+                }
                 _ => {} // from a newer firmware; ignore
             }
         }
         let setpoints = setpoints.unwrap_or(&[]).as_chunks::<2>().0;
         for (i, t) in s.temp_sensors.iter_mut().enumerate() {
+            t.zone = zones
+                .get(i)
+                .copied()
+                .filter(|z| (*z as usize) < MAX_ZONES)
+                .unwrap_or(0);
             t.setpoint_dc = setpoints
                 .get(i)
                 .map_or(s.setpoint_dc, |b| i16::from_le_bytes(*b));
@@ -323,11 +375,13 @@ mod tests {
                     addr: [1, 2, 3, 4, 5, 6],
                     setpoint_dc: 215,
                     name: SensorName::try_from("Landing").unwrap(),
+                    zone: 1,
                 },
                 TempSensor {
                     addr: [9; 6],
                     setpoint_dc: -40,
                     name: SensorName::new(),
+                    zone: 0,
                 },
             ])
             .unwrap(),
@@ -336,6 +390,7 @@ mod tests {
             heater_id: str32("boiler"),
             group_key: str32("secret"),
             timezone: str48("GMT0BST,M3.5.0/1,M10.5.0"),
+            zone_names: [ZoneName::try_from("Downstairs").unwrap(), ZoneName::new()],
             ..Settings::default()
         };
         let mut buf = [0u8; MAX_ENCODED];
@@ -373,11 +428,13 @@ mod tests {
                     addr: [1; 6],
                     setpoint_dc: 195,
                     name: SensorName::new(),
+                    zone: 0,
                 },
                 TempSensor {
                     addr: [2; 6],
                     setpoint_dc: 195,
                     name: SensorName::new(),
+                    zone: 0,
                 }
             ]
         );
@@ -395,6 +452,7 @@ mod tests {
                     addr: [0xAA; 6],
                     setpoint_dc: 0,
                     name: SensorName::try_from("n".repeat(MAX_SENSOR_NAME).as_str()).unwrap(),
+                    zone: 1,
                 },
                 MAX_TEMP_SENSORS,
             )
@@ -403,6 +461,9 @@ mod tests {
             heater_id: str32(&"h".repeat(32)),
             group_key: str32(&"k".repeat(32)),
             timezone: str48(&"t".repeat(48)),
+            zone_names: core::array::from_fn(|_| {
+                ZoneName::try_from("z".repeat(MAX_SENSOR_NAME).as_str()).unwrap()
+            }),
             wifi_psk: Some([0; 32]),
             admin_hash: Some(PasswordHash {
                 salt: [0; 16],

@@ -11,6 +11,7 @@ extern crate alloc;
 
 #[cfg(feature = "wifi")]
 mod ble;
+mod board;
 mod device;
 mod heating;
 mod mdns;
@@ -68,7 +69,11 @@ async fn main(spawner: Spawner) -> ! {
     wdt.set_timeout(MwdtStage::Stage0, WATCHDOG_TIMEOUT);
     wdt.enable();
 
-    log::info!("thermostat {VERSION} starting");
+    log::info!(
+        "thermostat {VERSION} starting ({} board, {} zone(s))",
+        board::NAME,
+        board::ZONES
+    );
 
     static FLASH: StaticCell<Flash> = StaticCell::new();
     let flash: &'static Flash = FLASH.init(Mutex::new(RefCell::new(FlashStorage::new(
@@ -101,6 +106,7 @@ async fn main(spawner: Spawner) -> ! {
         }
         Err(e) => panic!("settings partition: {e:?}"),
     };
+    let settings = board::fit(settings);
 
     static ALIGNED: StaticCell<embassy_boot::AlignedBuffer<4>> = StaticCell::new();
     let aligned = &mut ALIGNED.init(embassy_boot::AlignedBuffer([0; 4])).0;
@@ -135,7 +141,8 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(mdns::task(stack, dev).unwrap());
     spawner.spawn(sntp::task(stack, dev).unwrap());
     spawner.spawn(zones::task(stack, dev).unwrap());
-    // Board pins: zone relay on GPIO16 (active high), status LED on GPIO23.
+    // Board pins: zone relays on GPIO16 (and GPIO17 on the dual board), active
+    // high; status LED on GPIO23.
     let out = |pin: esp_hal::gpio::AnyPin<'static>| {
         esp_hal::gpio::Output::new(
             pin,
@@ -143,7 +150,14 @@ async fn main(spawner: Spawner) -> ! {
             esp_hal::gpio::OutputConfig::default(),
         )
     };
-    spawner.spawn(heating::task(out(peripherals.GPIO16.into()), dev).unwrap());
+    #[cfg(not(feature = "board-dual"))]
+    let relays = [out(peripherals.GPIO16.into())];
+    #[cfg(feature = "board-dual")]
+    let relays = [
+        out(peripherals.GPIO16.into()),
+        out(peripherals.GPIO17.into()),
+    ];
+    spawner.spawn(heating::task(relays, dev).unwrap());
     spawner.spawn(heating::led_task(out(peripherals.GPIO23.into())).unwrap());
     #[cfg(feature = "wifi")]
     spawner.spawn(ble::task(peripherals.BT, dev).unwrap());

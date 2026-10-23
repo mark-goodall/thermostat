@@ -123,6 +123,7 @@ pub fn error_code(e: OtaError) -> u8 {
         OtaError::Invalid => 4,
         OtaError::Flash => 5,
         OtaError::NotConfirmed => 6,
+        OtaError::WrongBoard => 7,
     }
 }
 

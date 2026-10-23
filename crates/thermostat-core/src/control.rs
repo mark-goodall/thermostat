@@ -4,7 +4,7 @@
 use heapless::Vec;
 
 use crate::ble::BleTable;
-use crate::settings::{MAX_TEMP_SENSORS, TempSensor};
+use crate::settings::{MAX_TEMP_SENSORS, MAX_ZONES, TempSensor};
 
 /// A sensor reading older than this is ignored.
 pub const READING_MAX_AGE_MS: u64 = 10 * 60 * 1000;
@@ -51,6 +51,8 @@ pub struct SensorReading {
     pub temperature_cc: i32,
     /// Tenths of a degree Celsius.
     pub setpoint_dc: i16,
+    /// Heating zone the sensor belongs to.
+    pub zone: u8,
 }
 
 impl SensorReading {
@@ -86,6 +88,7 @@ pub fn readings(table: &BleTable, selected: &[TempSensor], now_ms: u64) -> Readi
             addr: sel.addr,
             temperature_cc: t as i32,
             setpoint_dc: sel.setpoint_dc,
+            zone: sel.zone,
         });
     }
     out
@@ -297,6 +300,101 @@ impl Thermostat {
     }
 }
 
+/// The heating zones of one board, each with its own relay, sharing one heater.
+///
+/// Each zone decides on its own from its sensors (see [`Thermostat::update`]),
+/// and the minimum on time applies to the heater as a whole, exactly as for a
+/// heater group: a zone requesting heat gets it at once; a zone leaving while
+/// another zone keeps the heater on switches off at once; the last zone keeps
+/// its relay on until the heater has run for the minimum time since it started,
+/// whichever zone started it. The zones are decided together, so a zone always
+/// knows whether its neighbour is heating and never needs to ask (no release).
+pub struct Controller {
+    zones: [Thermostat; MAX_ZONES],
+    count: usize,
+    /// When this board last started the heater (monotonic ms).
+    heater_on_since_ms: Option<u64>,
+    started_heater: bool,
+}
+
+impl Controller {
+    pub const fn new(count: usize) -> Self {
+        assert!(count >= 1 && count <= MAX_ZONES);
+        Self {
+            zones: [const { Thermostat::new() }; MAX_ZONES],
+            count,
+            heater_on_since_ms: None,
+            started_heater: false,
+        }
+    }
+
+    pub fn zones(&self) -> &[Thermostat] {
+        &self.zones[..self.count]
+    }
+
+    pub fn zones_mut(&mut self) -> &mut [Thermostat] {
+        &mut self.zones[..self.count]
+    }
+
+    /// Whether any relay is on.
+    pub fn heating(&self) -> bool {
+        self.zones().iter().any(|z| z.heating())
+    }
+
+    /// Whether this board tells a heater group that it keeps the heater on.
+    pub fn requesting(&self) -> bool {
+        self.zones().iter().any(|z| z.requesting())
+    }
+
+    /// True once after an update in which this board started the heater.
+    pub fn take_heater_started(&mut self) -> bool {
+        core::mem::take(&mut self.started_heater)
+    }
+
+    /// Decide every zone from `readings` (each sensor counts for its own zone).
+    /// `remote` is the rest of a heater group (thermostats on other boards);
+    /// `GroupState::STANDALONE` when there is none. Returns the relay states.
+    pub fn update(
+        &mut self,
+        readings: &[SensorReading],
+        hysteresis_dc: u16,
+        min_on_ms: u64,
+        remote: GroupState,
+        now_ms: u64,
+    ) -> [bool; MAX_ZONES] {
+        let mut out = [false; MAX_ZONES];
+        for (i, relay) in out.iter_mut().enumerate().take(self.count) {
+            let mut mine = Readings::new();
+            for r in readings.iter().filter(|r| r.zone as usize == i) {
+                let _ = mine.push(*r);
+            }
+            let local_others = (0..self.count)
+                .filter(|&j| j != i)
+                .any(|j| self.zones[j].requesting());
+            let group = GroupState {
+                others_heating: remote.others_heating || local_others,
+                heater_on_since_ms: remote.heater_on_since_ms.max(self.heater_on_since_ms),
+            };
+            let zone = &mut self.zones[i];
+            zone.update(&mine, hysteresis_dc, min_on_ms, group, now_ms);
+            // Leaving while a neighbour on this board heats needs no confirmation:
+            // we know it keeps the heater on. Releases that depend only on other
+            // boards are left to the group messaging.
+            if let Some(r) = zone.release_pending()
+                && local_others
+            {
+                zone.released(r, true);
+            }
+            if zone.take_heater_started() {
+                self.heater_on_since_ms = Some(now_ms);
+                self.started_heater = true;
+            }
+            *relay = zone.heating();
+        }
+        out
+    }
+}
+
 impl Reason {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -327,10 +425,15 @@ mod tests {
     }
 
     fn reading(id: u8, t_cc: i32, setpoint_dc: i16) -> SensorReading {
+        zreading(0, id, t_cc, setpoint_dc)
+    }
+
+    fn zreading(zone: u8, id: u8, t_cc: i32, setpoint_dc: i16) -> SensorReading {
         SensorReading {
             addr: [id; 6],
             temperature_cc: t_cc,
             setpoint_dc,
+            zone,
         }
     }
 
@@ -339,6 +442,7 @@ mod tests {
             addr: [id; 6],
             setpoint_dc,
             name: Default::default(),
+            zone: 0,
         }
     }
 
@@ -625,6 +729,127 @@ mod tests {
         assert!(th.update(&room(2200), 10, min, GroupState::STANDALONE, 4_000));
         assert_eq!(th.reason, Reason::MinOnTime);
         assert!(th.release_pending().is_none() && th.requesting());
+    }
+
+    /// Zone 0 at `t0`, zone 1 at `t1` (hundredths); setpoints 20.0, hysteresis 1.0.
+    fn two(t0: i32, t1: i32) -> [SensorReading; 2] {
+        [zreading(0, 1, t0, 200), zreading(1, 2, t1, 200)]
+    }
+
+    const ALONE: GroupState = GroupState::STANDALONE;
+
+    #[test]
+    fn zones_switch_independently() {
+        let mut c = Controller::new(2);
+        assert_eq!(c.update(&two(2000, 2000), 10, 0, ALONE, 0), [false, false]);
+        assert_eq!(c.update(&two(1900, 2000), 10, 0, ALONE, 1), [true, false]);
+        assert!(c.take_heater_started());
+        assert_eq!(c.update(&two(1900, 1900), 10, 0, ALONE, 2), [true, true]);
+        assert!(!c.take_heater_started(), "zone 1 joined a running heater");
+        assert_eq!(c.update(&two(2100, 1900), 10, 0, ALONE, 3), [false, true]);
+        assert_eq!(c.update(&two(2100, 2100), 10, 0, ALONE, 4), [false, false]);
+        // A zone with no fresh reading is off; the other carries on.
+        assert_eq!(
+            c.update(&[zreading(1, 2, 1900, 200)], 10, 0, ALONE, 5),
+            [false, true]
+        );
+        assert_eq!(c.zones()[0].reason, Reason::NoReading);
+    }
+
+    #[test]
+    fn minimum_on_time_covers_the_heater_across_zones() {
+        let min = 120_000;
+        let mut c = Controller::new(2);
+        // Zone 0 starts the heater at t=0; zone 1 joins at 10 s.
+        assert_eq!(c.update(&two(1900, 2000), 10, min, ALONE, 0), [true, false]);
+        assert_eq!(
+            c.update(&two(1900, 1900), 10, min, ALONE, 10_000),
+            [true, true]
+        );
+        // Zone 0 warm at 20 s: zone 1 keeps the heater on, so zone 0 leaves at once.
+        assert_eq!(
+            c.update(&two(2100, 1900), 10, min, ALONE, 20_000),
+            [false, true]
+        );
+        assert_eq!(c.zones()[0].reason, Reason::AboveBand);
+        // Zone 1 warm at 30 s: it is last, held until 2 min after the heater started.
+        assert_eq!(
+            c.update(&two(2100, 2100), 10, min, ALONE, 30_000),
+            [false, true]
+        );
+        assert_eq!(c.zones()[1].reason, Reason::MinOnTime);
+        assert_eq!(c.zones()[1].hold_remaining_ms(30_000), Some(90_000));
+        assert_eq!(
+            c.update(&two(2100, 2100), 10, min, ALONE, min),
+            [false, false]
+        );
+        // Heat is never delayed: zone 0 restarts the heater straight away.
+        assert_eq!(
+            c.update(&two(1900, 2100), 10, min, ALONE, min + 1),
+            [true, false]
+        );
+        assert!(c.take_heater_started());
+    }
+
+    #[test]
+    fn both_zones_warm_together_hold_one_relay() {
+        let min = 120_000;
+        let mut c = Controller::new(2);
+        assert_eq!(c.update(&two(1900, 1900), 10, min, ALONE, 0), [true, true]);
+        // Both warm in the same step: one zone leaves, the other holds the heater.
+        assert_eq!(
+            c.update(&two(2100, 2100), 10, min, ALONE, 10_000),
+            [false, true]
+        );
+        assert_eq!(c.zones()[1].reason, Reason::MinOnTime);
+        assert!(c.zones().iter().all(|z| z.release_pending().is_none()));
+        // The held zone wanting heat again simply carries on.
+        assert_eq!(
+            c.update(&two(2100, 1900), 10, min, ALONE, 20_000),
+            [false, true]
+        );
+        assert_eq!(c.zones()[1].reason, Reason::BelowBand);
+    }
+
+    #[test]
+    fn hold_counts_from_the_heater_start_not_the_last_zone() {
+        let min = 120_000;
+        let mut c = Controller::new(2);
+        assert_eq!(c.update(&two(1900, 2000), 10, min, ALONE, 0), [true, false]);
+        // Zone 1 joins late (100 s) and is the last to leave (110 s): held only
+        // until 120 s, the heater having started at 0.
+        assert_eq!(
+            c.update(&two(1900, 1900), 10, min, ALONE, 100_000),
+            [true, true]
+        );
+        assert_eq!(
+            c.update(&two(2100, 1900), 10, min, ALONE, 105_000),
+            [false, true]
+        );
+        assert_eq!(
+            c.update(&two(2100, 2100), 10, min, ALONE, 110_000),
+            [false, true]
+        );
+        assert_eq!(c.zones()[1].hold_remaining_ms(110_000), Some(10_000));
+    }
+
+    #[test]
+    fn one_zone_controller_matches_a_thermostat() {
+        let min = 60_000;
+        let mut c = Controller::new(1);
+        assert_eq!(c.zones().len(), 1);
+        assert_eq!(c.update(&room(1800), 10, min, ALONE, 0), [true, false]);
+        assert_eq!(c.update(&room(2200), 10, min, ALONE, 30_000), [true, false]);
+        assert_eq!(c.zones()[0].reason, Reason::MinOnTime);
+        // In a heater group, leaving early still waits for the group to confirm.
+        let busy = GroupState {
+            others_heating: true,
+            heater_on_since_ms: Some(0),
+        };
+        assert_eq!(c.update(&room(2200), 10, min, busy, 40_000), [true, false]);
+        let r = c.zones()[0].release_pending().unwrap();
+        c.zones_mut()[0].released(r, true);
+        assert!(!c.heating());
     }
 
     #[test]

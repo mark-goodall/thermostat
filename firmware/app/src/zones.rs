@@ -82,14 +82,14 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
             let msg = ZoneMessage {
                 heater: s.heater_id.clone(),
                 zone: s.hostname.clone(),
-                heat: d.thermostat.requesting(),
+                heat: d.heating.requesting(),
                 heater_on_since: d.group.heater_on_since,
                 ts: d.clock.unix_s(now.as_micros()),
             };
             let targets: Vec<([u8; 4], u16), MAX_PEERS> =
                 d.group.targets(now.as_millis()).collect();
             Some((
-                d.thermostat.release_pending(),
+                d.heating.zones()[0].release_pending(),
                 msg.encode(&s.group_key),
                 targets,
                 s.heater_id.clone(),
@@ -132,7 +132,7 @@ pub async fn task(stack: Stack<'static>, dev: Handle) {
                 if !confirmed {
                     d.group.settle_release(now.as_millis());
                 }
-                d.thermostat.released(release, confirmed);
+                d.heating.zones_mut()[0].released(release, confirmed);
             });
             log::info!(
                 "zones: release {}",

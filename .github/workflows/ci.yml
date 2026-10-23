@@ -24,11 +24,12 @@ jobs:
       - run: cargo test -p thermostat-core -p embassy-boot-esp -p xtask --features embassy-boot-esp/std
 
   firmware:
-    name: Firmware build (${{ matrix.target }})
+    name: Firmware build (${{ matrix.target }}, ${{ matrix.board }} board)
     runs-on: ubuntu-latest
     strategy:
       matrix:
         target: [wifi, qemu]
+        board: [single, dual]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,11 +44,11 @@ jobs:
           ldproxy: false
           version: 1.97.0.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo xtask build --release --target ${{ matrix.target }}
+      - run: cargo xtask build --release --target ${{ matrix.target }} --board ${{ matrix.board }}
       - uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.target }}
-          path: target/images/${{ matrix.target }}/
+          name: firmware-${{ matrix.target }}-${{ matrix.board }}
+          path: target/images/${{ matrix.target }}${{ matrix.board == 'dual' && '-dual' || '' }}/
 
   qemu-e2e:
     name: End-to-end tests in QEMU

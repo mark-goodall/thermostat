@@ -20,6 +20,8 @@ qemu = ["dep:esp-openeth"]
 wifi = ["dep:esp-radio", "esp-rtos/esp-radio", "dep:bt-hci"]
 # Test hook: never confirm the image, so the bootloader must roll it back.
 fail-selftest = []
+# Two-zone board: relays on GPIO16 and GPIO17 (see src/board.rs).
+board-dual = []
 
 [dependencies]
 thermostat-core = { workspace = true }

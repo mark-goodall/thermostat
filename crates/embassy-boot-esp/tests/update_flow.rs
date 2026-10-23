@@ -5,7 +5,7 @@ use core::cell::RefCell;
 
 use embassy_boot::State;
 use embassy_boot_esp::boot;
-use embassy_boot_esp::image::{self, CHIP_ESP32, ESP32, ImageError};
+use embassy_boot_esp::image::{self, CHIP_ESP32, ESP32, Header, ImageError};
 use embassy_boot_esp::partition::{self, BootPartitions, Partition};
 use embassy_boot_esp::{BootStatus, UpdateError, Updater};
 use embassy_sync::blocking_mutex::{Mutex, raw::NoopRawMutex};
@@ -151,6 +151,18 @@ impl Device {
         up.finish().map(|_| ())
     }
 
+    fn upload_checked(
+        &self,
+        img: &[u8],
+        accept: impl FnOnce(&Header) -> bool,
+    ) -> Result<(), UpdateError> {
+        let mut buf = Aligned([0; 4096]);
+        let mut up = self.updater(&mut buf.0[..4]);
+        up.begin(img.len() as u32)?;
+        up.write(0, img)?;
+        up.finish_checked(accept).map(|_| ())
+    }
+
     fn status(&self) -> BootStatus {
         let mut buf = [0u8; 4];
         self.updater(&mut buf).status().unwrap()
@@ -199,6 +211,21 @@ fn corrupt_upload_is_rejected() {
         Err(UpdateError::Image(ImageError::HashMismatch))
     );
     assert_eq!(dev.boot().unwrap(), (State::Boot, "1.0.0".into()));
+}
+
+#[test]
+fn refused_image_is_not_staged() {
+    let dev = Device::new(&make_image("1.0.0", 0x11));
+    assert_eq!(
+        dev.upload_checked(&make_image("2.0.0@dual", 0x22), |h| !h
+            .version_str()
+            .contains('@')),
+        Err(UpdateError::Rejected)
+    );
+    assert_eq!(dev.boot().unwrap(), (State::Boot, "1.0.0".into()));
+    dev.upload_checked(&make_image("2.0.0", 0x22), |_| true)
+        .unwrap();
+    assert_eq!(dev.boot().unwrap().1, "2.0.0");
 }
 
 #[test]

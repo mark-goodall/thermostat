@@ -92,9 +92,9 @@ A change takes effect after a reboot.
   "Multiple zones on one heater".
 - **Fail-safe.** With no fresh reading from any selected sensor, or none
   selected, heating is off at once.
-- **Output.** Heat demand drives the zone relay on GPIO16, active high. The
-  status LED on GPIO23 blinks at 1 Hz while the relay is on and 0.2 Hz while it
-  is off. Pins are set in `main.rs`.
+- **Output.** Heat demand drives the zone relay on GPIO16, active high (the
+  two-zone board adds GPIO17, see below). The status LED on GPIO23 blinks at
+  1 Hz while a relay is on and 0.2 Hz while none is. Pins are set in `main.rs`.
 - **Status.** The status page and `/api/status` show the room temperature, the
   per-sensor readings, the heating state and the reason (`a sensor is below its
   setpoint`, `all sensors above setpoint`, `within hysteresis band`, `keeping the heater on for its minimum on time`,
@@ -109,6 +109,40 @@ Supported sensors:
 | ThermoPro TP357/TP357S/TP35x/TP39x | manufacturer data (company-ID field reused) | recognised by the frame format: `C2` marker, length, trailer bytes, plausible values. A name, if heard, also confirms it. Works with passive scanning. |
 | Xiaomi LYWSD03MMC etc. with pvvx/ATC firmware | service data `0x181A` | |
 | any BTHome v2 device (unencrypted) | service data `0xFCD2` | |
+
+## Two-zone board
+
+A second firmware drives a board with **two relays, one per heating zone, both
+on one heater**: GPIO16 (zone 1) and GPIO17 (zone 2), LED on GPIO23.
+
+```sh
+cargo xtask build --release --board dual     # -> target/images/wifi-dual/
+cargo xtask flash --release --board dual --port /dev/ttyUSB0
+```
+
+- **Zones.** Name them on the settings page (up to 16 characters; empty =
+  "Zone 1"/"Zone 2"), and pick a zone for each selected sensor. Each zone
+  decides from its own sensors with the usual rule (on when any is low, off
+  when all are high).
+- **Minimum on time** covers the heater as a whole, as for a heater group:
+  - a zone calling for heat always gets it at once;
+  - a zone leaving while the other zone heats switches off at once;
+  - the last zone switching off keeps its relay on until the heater has run
+    for the minimum time since it started, whichever zone started it.
+  Both zones are decided in one step, so the two-step release is not needed.
+- **No heater groups.** The two-zone board runs its own heater; the heater id
+  settings are hidden and ignored.
+- **Status.** The status page has a row per zone (relay, reason, time to go,
+  its sensors); `/api/status` adds `"zones": [{name, heating, reason,
+  hold_remaining_s}]`, and each sensor carries its `zone`. The top-level
+  `heating` is true while any zone heats.
+- **Images are board-specific.** A dual image's version ends in `@dual`
+  (e.g. `0.1.0+1a2b3c4@dual`). Each firmware refuses an update built for the
+  other board (HTTP: `400 image is for a different board`; serial: NAK code 7),
+  so a single-zone image cannot leave the second relay unmanaged.
+
+Logic: `control::Controller` in `thermostat-core` (host-tested); board pins and
+zone count: `firmware/app/src/board.rs`.
 
 ## Multiple zones on one heater
 
@@ -242,6 +276,7 @@ the natural next step.
 ```sh
 cargo test                                   # host tests (core, bootloader logic, tooling)
 cargo xtask build --release                  # hardware images -> target/images/wifi/
+cargo xtask build --release --board dual     # two-zone board -> target/images/wifi-dual/
 cargo xtask flash --release --port /dev/ttyUSB0 [--erase-settings]
 cargo xtask qemu                             # boot in QEMU; web UI at http://localhost:8080
 cargo xtask qemu --serial-port 5555          # console on TCP (waits for a client)

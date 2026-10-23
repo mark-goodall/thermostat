@@ -26,12 +26,23 @@ struct Image {
 }
 
 fn build_variant(dir: &Path, release: bool, version: &str, features: &str) -> Result<Image> {
-    eprintln!("== building firmware {version}");
+    build_board(dir, release, version, features, "single")
+}
+
+fn build_board(
+    dir: &Path,
+    release: bool,
+    version: &str,
+    features: &str,
+    board: &str,
+) -> Result<Image> {
+    eprintln!("== building firmware {version} ({board} board)");
     let a = crate::build(&BuildArgs {
         release,
         target: "qemu".into(),
         version: Some(version.into()),
         features: features.into(),
+        board: board.into(),
     })?;
     let img = dir.join(format!("{version}.img"));
     let flash = dir.join(format!("{version}-flash.bin"));
@@ -355,6 +366,7 @@ pub fn run(release: bool, zones_only: bool) -> Result<()> {
         let v3 = build_variant(&dir, release, "e2e-3", "")?;
         let sntp_port = start_sntp_server()?;
         run_zones(&dir, &v3.flash, sntp_port)?;
+        run_dual(&dir, release, &v3.img, sntp_port)?;
         eprintln!("zone tests passed");
         return Ok(());
     }
@@ -540,6 +552,7 @@ pub fn run(release: bool, zones_only: bool) -> Result<()> {
 
     drop(emu);
     run_zones(&dir, &v3.flash, sntp_port)?;
+    run_dual(&dir, release, &v3.img, sntp_port)?;
 
     eprintln!(
         "all end-to-end tests passed in {:.0}s",
@@ -578,6 +591,7 @@ fn zone_flash(
             addr: sensor,
             setpoint_dc: 210,
             name: thermostat_core::settings::SensorName::try_from(name).unwrap(),
+            zone: 0,
         }])
         .unwrap(),
         // Unique id: the emulated zones can reach the real LAN through QEMU's
@@ -587,13 +601,156 @@ fn zone_flash(
         ntp_server: str48(&format!("10.0.2.2:{sntp_port}")),
         ..Settings::default()
     };
+    flash_with_settings(dir, base_flash, name, &settings)
+}
+
+/// A copy of `base_flash` with `settings` written to the settings partition.
+fn flash_with_settings(
+    dir: &Path,
+    base_flash: &Path,
+    name: &str,
+    settings: &thermostat_core::settings::Settings,
+) -> Result<PathBuf> {
     let mut flash = std::fs::read(base_flash)?;
     let part = crate::provision::settings_partition();
-    let image = crate::provision::settings_image(&settings)?;
+    let image = crate::provision::settings_image(settings)?;
     flash[part.offset as usize..part.offset as usize + image.len()].copy_from_slice(&image);
     let path = dir.join(format!("{name}-flash.bin"));
     std::fs::write(&path, flash)?;
     Ok(path)
+}
+
+fn zone_heating(s: &Value, zone: usize) -> Option<bool> {
+    s["zones"][zone]["heating"].as_bool()
+}
+
+/// The two-zone board: zones switch independently and share the heater's
+/// minimum on time; a single-board image is refused.
+pub fn run_dual(dir: &Path, release: bool, single_img: &Path, sntp_port: u16) -> Result<()> {
+    use thermostat_core::auth::{DEFAULT_ITERATIONS, PasswordHash};
+    use thermostat_core::settings::{SensorName, Settings, TempSensor, str32, str48};
+    let dual = build_board(dir, release, "e2e-dual", "", "dual")?;
+    eprintln!("== two-zone board");
+    let (down, up) = ([0xD1; 6], [0xE2; 6]);
+    let sensor = |addr, zone| TempSensor {
+        addr,
+        setpoint_dc: 210,
+        name: SensorName::new(),
+        zone,
+    };
+    let settings = Settings {
+        hostname: str32("e2e-dual"),
+        admin_hash: Some(PasswordHash::new(
+            PASSWORD,
+            crate::provision::random_salt()?,
+            DEFAULT_ITERATIONS,
+        )),
+        hysteresis_dc: 4,
+        min_on_min: 2,
+        temp_sensors: heapless::Vec::from_slice(&[sensor(down, 0), sensor(up, 1)]).unwrap(),
+        zone_names: [
+            SensorName::try_from("Down").unwrap(),
+            SensorName::try_from("Up").unwrap(),
+        ],
+        ntp_server: str48(&format!("10.0.2.2:{sntp_port}")),
+        ..Settings::default()
+    };
+    let flash = flash_with_settings(dir, &dual.flash, "e2e-dual", &settings)?;
+    let emu = Emulator::start(&flash, &dir.join("console-dual.log"))?;
+    let basic = format!(
+        "Basic {}",
+        ota::base64(format!("admin:{PASSWORD}").as_bytes())
+    );
+
+    step("dual board boots with two named zones", || {
+        let s = emu.wait_status("booted", Duration::from_secs(90), |s| {
+            s["zones"].as_array().is_some_and(|z| z.len() == 2) && !s["time"].is_null()
+        })?;
+        anyhow::ensure!(
+            s["version"].as_str().is_some_and(|v| v.ends_with("@dual"))
+                && s["zones"][0]["name"] == "Down"
+                && s["zones"][1]["name"] == "Up",
+            "{s}"
+        );
+        Ok(())
+    })?;
+
+    step("zone Down heats alone", || {
+        inject(&emu, &basic, down, "19.0")?;
+        let s = emu.wait_status("Down on", Duration::from_secs(15), |s| {
+            zone_heating(s, 0) == Some(true)
+        })?;
+        anyhow::ensure!(zone_heating(&s, 1) == Some(false), "Up must stay off: {s}");
+        Ok(())
+    })?;
+
+    step("zone Up joins; Down leaves at once while Up heats", || {
+        inject(&emu, &basic, up, "19.0")?;
+        emu.wait_status("Up on", Duration::from_secs(15), |s| {
+            zone_heating(s, 1) == Some(true)
+        })?;
+        inject(&emu, &basic, down, "23.0")?;
+        let s = emu.wait_status("Down off", Duration::from_secs(15), |s| {
+            zone_heating(s, 0) == Some(false)
+        })?;
+        anyhow::ensure!(
+            s["zones"][0]["reason"] == "all sensors above setpoint"
+                && zone_heating(&s, 1) == Some(true),
+            "{s}"
+        );
+        Ok(())
+    })?;
+
+    step(
+        "zone Up is last: held until 2 min after the heater started",
+        || {
+            let started = Instant::now();
+            inject(&emu, &basic, up, "23.0")?;
+            let s = emu.wait_status("Up held", Duration::from_secs(15), |s| {
+                s["zones"][1]["hold_remaining_s"].as_u64().is_some()
+            })?;
+            anyhow::ensure!(
+                zone_heating(&s, 1) == Some(true),
+                "Up must keep its relay on: {s}"
+            );
+            // The heater started when Down switched on, before this step.
+            let hold = s["zones"][1]["hold_remaining_s"].as_u64().unwrap();
+            anyhow::ensure!(
+                hold < 120,
+                "hold counts from the heater start, not from Up: {s}"
+            );
+            emu.wait_status("Up off after the hold", Duration::from_secs(150), |s| {
+                zone_heating(s, 1) == Some(false)
+            })?;
+            anyhow::ensure!(started.elapsed() >= Duration::from_secs(hold.saturating_sub(5)));
+            Ok(())
+        },
+    )?;
+
+    step("heat is never delayed after the hold", || {
+        inject(&emu, &basic, down, "19.0")?;
+        let s = emu.wait_status("Down on", Duration::from_secs(15), |s| {
+            zone_heating(s, 0) == Some(true)
+        })?;
+        anyhow::ensure!(s["zones"][0]["hold_remaining_s"].is_null(), "{s}");
+        Ok(())
+    })?;
+
+    step("an image for the single-zone board is refused", || {
+        let auth = [("Authorization", basic.as_str())];
+        let (code, body) = emu.request(
+            "POST",
+            "/api/update?reboot=0",
+            &auth,
+            &std::fs::read(single_img)?,
+        )?;
+        anyhow::ensure!(
+            code == 400 && body.contains("different board"),
+            "single-board upload: {code} {body}"
+        );
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// QEMU for one zone: a single NIC on a UDP datagram link to the test switch.

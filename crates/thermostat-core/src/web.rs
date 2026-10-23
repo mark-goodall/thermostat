@@ -96,11 +96,35 @@ pub async fn handle<S: Read + Write, P: Platform>(
                         json_str(w, s.temp_sensor(&r.addr).map_or("", |t| t.name.as_str()))?;
                         write!(
                             w,
-                            ",\"temperature\":{},\"setpoint\":{},\"band\":\"{}\"}}",
+                            ",\"zone\":{},\"temperature\":{},\"setpoint\":{},\"band\":\"{}\"}}",
+                            r.zone,
                             Tenths(crate::control::cc_to_dc(r.temperature_cc) as i32),
                             Tenths(r.setpoint_dc as i32),
                             r.band(s.hysteresis_dc).as_str()
                         )?;
+                    }
+                    w.write_str("],\"zones\":[")?;
+                    for (i, z) in st.zones.iter().enumerate() {
+                        w.write_str(if i > 0 { ",{\"name\":" } else { "{\"name\":" })?;
+                        let mut name = String::<24>::new();
+                        match s.zone_names.get(i).filter(|n| !n.is_empty()) {
+                            Some(n) => {
+                                let _ = name.push_str(n);
+                            }
+                            None => {
+                                let _ = write!(name, "Zone {}", i + 1);
+                            }
+                        }
+                        json_str(w, &name)?;
+                        write!(
+                            w,
+                            ",\"heating\":{},\"reason\":\"{}\",\"hold_remaining_s\":",
+                            z.heating, z.reason
+                        )?;
+                        match z.hold_remaining_s {
+                            Some(h) => write!(w, "{h}}}")?,
+                            None => w.write_str("null}")?,
+                        }
                     }
                     write!(
                         w,
@@ -252,8 +276,9 @@ pub async fn handle<S: Read + Write, P: Platform>(
             let s = p.settings();
             let now = p.now_ms();
             let found = sensor_candidates(p);
+            let zones = p.zone_count();
             page(sock, page_buf, "Settings", true, |w| {
-                settings_form(w, &s, None, &found, now)
+                settings_form(w, &s, zones, None, &found, now)
             })
             .await
         }
@@ -272,8 +297,9 @@ pub async fn handle<S: Read + Write, P: Platform>(
             };
             let now = p.now_ms();
             let found = sensor_candidates(p);
+            let zones = p.zone_count();
             page(sock, page_buf, "Settings", true, |w| {
-                settings_form(w, &s, Some(msg), &found, now)
+                settings_form(w, &s, zones, Some(msg), &found, now)
             })
             .await
         }
@@ -496,8 +522,20 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
     }
     s.hysteresis_dc = hyst as u16;
 
+    let zones = p.zone_count();
+    for (i, name) in s.zone_names.iter_mut().enumerate().take(zones) {
+        if let Some(raw) = http::form_value(form, &zone_field(i)) {
+            let text: String<64> = http::url_decode(raw).ok_or("Zone name is too long.")?;
+            *name = crate::settings::ZoneName::try_from(text.trim())
+                .map_err(|_| "Zone names can be at most 16 characters.")?;
+        }
+    }
+
     // Older forms (and scripts) may omit these fields: keep the stored values.
-    if let Some(raw) = http::form_value(form, "heater_id") {
+    // Boards with several zones run their own heater and ignore heater groups.
+    if zones > 1 {
+        s.heater_id.clear();
+    } else if let Some(raw) = http::form_value(form, "heater_id") {
         let id: Str32 = http::url_decode(raw).ok_or("Heater id is too long.")?;
         if !id
             .chars()
@@ -568,11 +606,20 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
             }
             None => before.map(|t| t.name.clone()).unwrap_or_default(),
         };
+        let zone = match http::form_value(form, &sensor_field("zn_", &addr)) {
+            Some(raw) => raw
+                .parse::<u8>()
+                .ok()
+                .filter(|z| (*z as usize) < zones)
+                .ok_or("Invalid zone for a sensor.")?,
+            None => before.map_or(0, |t| t.zone).min(zones as u8 - 1),
+        };
         if s.temp_sensors
             .push(crate::settings::TempSensor {
                 addr,
                 setpoint_dc,
                 name,
+                zone,
             })
             .is_err()
         {
@@ -812,10 +859,66 @@ fn status_page(
         st.uptime_s,
         Escape(&st.network),
     )?;
+    if st.zones.len() > 1 {
+        // Several zones: one row each, with its relay state and its sensors.
+        w.write_str("</td></tr>")?;
+        for (z, zs) in st.zones.iter().enumerate() {
+            w.write_str("<tr><td>")?;
+            zone_name(w, s, z)?;
+            write!(
+                w,
+                "</td><td><b>{}</b> <small>({}",
+                if zs.heating { "ON" } else { "off" },
+                zs.reason
+            )?;
+            hold_text(w, zs.hold_remaining_s)?;
+            w.write_str(")</small>")?;
+            let mut any = false;
+            for t in s.temp_sensors.iter().filter(|t| t.zone as usize == z) {
+                any = true;
+                w.write_str("<br>")?;
+                sensor_line(w, s, st, t)?;
+            }
+            if !any {
+                w.write_str("<br>no sensors in this zone (see Settings)")?;
+            }
+            w.write_str("</td></tr>")?;
+        }
+        return status_tail(w, s, st, zone);
+    }
     if s.temp_sensors.is_empty() {
         w.write_str("no sensors selected (see Settings)")?;
     }
     for t in &s.temp_sensors {
+        sensor_line(w, s, st, t)?;
+        w.write_str("<br>")?;
+    }
+    write!(
+        w,
+        "</td></tr><tr><td>Heating</td><td><b>{}</b> <small>({}",
+        if st.heating { "ON" } else { "off" },
+        st.heating_reason
+    )?;
+    hold_text(w, st.hold_remaining_s)?;
+    w.write_str(")</small></td></tr>")?;
+    status_tail(w, s, st, zone)
+}
+
+fn hold_text(w: &mut BufWriter<'_>, hold_s: Option<u64>) -> core::fmt::Result {
+    if let Some(r) = hold_s {
+        let m = r.div_ceil(60);
+        write!(w, ", {} h {:02} min to go", m / 60, m % 60)?;
+    }
+    Ok(())
+}
+
+fn sensor_line(
+    w: &mut BufWriter<'_>,
+    s: &Settings,
+    st: &crate::platform::DeviceStatus,
+    t: &crate::settings::TempSensor,
+) -> core::fmt::Result {
+    {
         sensor_label(w, s, &t.addr)?;
         w.write_str(" ")?;
         match st.readings.iter().find(|r| r.addr == t.addr) {
@@ -832,19 +935,17 @@ fn status_page(
                 Tenths(t.setpoint_dc as i32)
             )?,
         }
-        w.write_str("<br>")?;
     }
-    write!(
-        w,
-        "</td></tr><tr><td>Heating</td><td><b>{}</b> <small>({}",
-        if st.heating { "ON" } else { "off" },
-        st.heating_reason
-    )?;
-    if let Some(r) = st.hold_remaining_s {
-        let m = r.div_ceil(60);
-        write!(w, ", {} h {:02} min to go", m / 60, m % 60)?;
-    }
-    w.write_str(")</small></td></tr>")?;
+    Ok(())
+}
+
+/// Heater group (if any) and the end of the status table.
+fn status_tail(
+    w: &mut BufWriter<'_>,
+    s: &Settings,
+    st: &crate::platform::DeviceStatus,
+    zone: Option<&ZoneSnapshot>,
+) -> core::fmt::Result {
     if let Some(z) = zone {
         write!(
             w,
@@ -931,22 +1032,53 @@ fn sensor_field(prefix: &str, addr: &[u8; 6]) -> String<16> {
     f
 }
 
+/// Form field for a zone's name.
+fn zone_field(zone: usize) -> String<8> {
+    let mut f = String::new();
+    let _ = write!(f, "zone{zone}");
+    f
+}
+
+/// A zone's display name: its configured name or "Zone N".
+fn zone_name(w: &mut BufWriter<'_>, s: &Settings, zone: usize) -> core::fmt::Result {
+    match s.zone_names.get(zone).filter(|n| !n.is_empty()) {
+        Some(n) => write!(w, "{}", Escape(n)),
+        None => write!(w, "Zone {}", zone + 1),
+    }
+}
+
 fn sensor_inputs(
     w: &mut BufWriter<'_>,
+    s: &Settings,
+    zones: usize,
     addr: &[u8; 6],
-    setpoint_dc: i16,
-    name: &str,
+    t: Option<&crate::settings::TempSensor>,
 ) -> core::fmt::Result {
     write!(
         w,
         "<div style=margin-left:2em><label>Name<input name={} value=\"{}\" maxlength={} placeholder=\"e.g. Landing\"></label>\
-<label>Setpoint (°C)<input name={} value={} inputmode=decimal size=5></label></div>",
+<label>Setpoint (°C)<input name={} value={} inputmode=decimal size=5></label>",
         sensor_field("nm_", addr),
-        Escape(name),
+        Escape(t.map_or("", |t| t.name.as_str())),
         crate::settings::MAX_SENSOR_NAME,
         sensor_field("sp_", addr),
-        Tenths(setpoint_dc as i32)
-    )
+        Tenths(t.map_or(s.setpoint_dc, |t| t.setpoint_dc) as i32)
+    )?;
+    if zones > 1 {
+        write!(w, "<label>Zone<select name={}>", sensor_field("zn_", addr))?;
+        for z in 0..zones {
+            let sel = if t.map_or(0, |t| t.zone as usize) == z {
+                " selected"
+            } else {
+                ""
+            };
+            write!(w, "<option value={z}{sel}>")?;
+            zone_name(w, s, z)?;
+            w.write_str("</option>")?;
+        }
+        w.write_str("</select></label>")?;
+    }
+    w.write_str("</div>")
 }
 
 /// `<b>name</b> <code>addr</code>`, or just the address when unnamed.
@@ -960,6 +1092,7 @@ fn sensor_label(w: &mut BufWriter<'_>, s: &Settings, addr: &[u8; 6]) -> core::fm
 fn sensor_fieldset(
     w: &mut BufWriter<'_>,
     s: &Settings,
+    zones: usize,
     found: &Candidates,
     now: u64,
 ) -> core::fmt::Result {
@@ -997,12 +1130,7 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
             d.rssi,
             now.saturating_sub(d.sensor_ms) / 1000
         )?;
-        sensor_inputs(
-            w,
-            &d.addr,
-            selected.map_or(s.setpoint_dc, |t| t.setpoint_dc),
-            selected.map_or("", |t| t.name.as_str()),
-        )?;
+        sensor_inputs(w, s, zones, &d.addr, selected)?;
     }
     for t in &s.temp_sensors {
         if !found.iter().any(|d| d.addr == t.addr) {
@@ -1014,7 +1142,7 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
             )?;
             sensor_label(w, s, &t.addr)?;
             w.write_str(" · not heard recently</label>")?;
-            sensor_inputs(w, &t.addr, t.setpoint_dc, &t.name)?;
+            sensor_inputs(w, s, zones, &t.addr, Some(t))?;
         }
     }
     if !any {
@@ -1026,6 +1154,7 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
 fn settings_form(
     w: &mut BufWriter<'_>,
     s: &Settings,
+    zones: usize,
     n: Option<Notice>,
     found: &Candidates,
     now: u64,
@@ -1045,13 +1174,7 @@ fn settings_form(
 </fieldset><fieldset><legend>Time</legend>\
 <label>NTP server (host or host:port)<input name=ntp_server value=\"{}\" maxlength=48 required></label>\
 <label>Timezone (POSIX TZ, e.g. GMT0BST,M3.5.0/1,M10.5.0 · CET-1CEST,M3.5.0,M10.5.0/3 · EST5EDT,M3.2.0,M11.1.0 · UTC0)\
-<input name=timezone value=\"{}\" maxlength=48 required></label></fieldset>\
-<fieldset><legend>Heater group</legend><p><small>Thermostats with the same heater id share one heater: \
-it runs while any zone requests heat, and the minimum on time applies to the heater as a whole. \
-Leave empty if this thermostat has its own heater.</small></p>\
-<label>Heater id<input name=heater_id value=\"{}\" maxlength=32></label>\
-<label>Group key (same on every zone; signs zone messages){}<input type=password name=group_key maxlength=32 autocomplete=new-password></label>\
-{}</fieldset>",
+<input name=timezone value=\"{}\" maxlength=48 required></label></fieldset>",
         Escape(&s.hostname),
         Escape(&s.wifi_ssid),
         if s.wifi_psk.is_some() {
@@ -1064,6 +1187,45 @@ Leave empty if this thermostat has its own heater.</small></p>\
         s.min_on_min,
         Escape(&s.ntp_server),
         Escape(&s.timezone),
+    )?;
+    if zones > 1 {
+        w.write_str(
+            "<fieldset><legend>Zones</legend><p><small>One relay per zone, both on one heater: it runs \
+while any zone requests heat, and the minimum on time applies to the heater as a whole.</small></p>",
+        )?;
+        for z in 0..zones {
+            write!(
+                w,
+                "<label>Zone {} name<input name={} value=\"{}\" maxlength={} placeholder=\"Zone {}\"></label>",
+                z + 1,
+                zone_field(z),
+                Escape(&s.zone_names[z]),
+                crate::settings::MAX_SENSOR_NAME,
+                z + 1
+            )?;
+        }
+        w.write_str("</fieldset>")?;
+    } else {
+        heater_group_fieldset(w, s)?;
+    }
+    sensor_fieldset(w, s, zones, found, now)?;
+    w.write_str(
+        "<fieldset><legend>Admin password</legend>\
+<label>New password (leave empty to keep)<input type=password name=new_password minlength=8 autocomplete=new-password></label>\
+<label>Repeat new password<input type=password name=new_password2 autocomplete=new-password></label>\
+</fieldset><button>Save</button></form>",
+    )
+}
+
+fn heater_group_fieldset(w: &mut BufWriter<'_>, s: &Settings) -> core::fmt::Result {
+    write!(
+        w,
+        "<fieldset><legend>Heater group</legend><p><small>Thermostats with the same heater id share one heater: \
+it runs while any zone requests heat, and the minimum on time applies to the heater as a whole. \
+Leave empty if this thermostat has its own heater.</small></p>\
+<label>Heater id<input name=heater_id value=\"{}\" maxlength=32></label>\
+<label>Group key (same on every zone; signs zone messages){}<input type=password name=group_key maxlength=32 autocomplete=new-password></label>\
+{}</fieldset>",
         Escape(&s.heater_id),
         if s.group_key.is_empty() {
             " — none set, messages are unsigned"
@@ -1075,13 +1237,6 @@ Leave empty if this thermostat has its own heater.</small></p>\
         } else {
             "<label><input type=checkbox name=clear_group_key style=width:auto> Remove the group key</label>"
         },
-    )?;
-    sensor_fieldset(w, s, found, now)?;
-    w.write_str(
-        "<fieldset><legend>Admin password</legend>\
-<label>New password (leave empty to keep)<input type=password name=new_password minlength=8 autocomplete=new-password></label>\
-<label>Repeat new password<input type=password name=new_password2 autocomplete=new-password></label>\
-</fieldset><button>Save</button></form>",
     )
 }
 
@@ -1400,6 +1555,10 @@ mod tests {
         ble: Option<crate::ble::BleTable>,
         time: Option<i64>,
         hold: Option<u64>,
+        /// Zones on the fake board (0 = default single zone) and their status.
+        zone_count: usize,
+        zone_status: std::vec::Vec<crate::platform::ZoneStatus>,
+        readings: crate::control::Readings,
         group: crate::zones::Group,
         injected: Option<([u8; 6], i16)>,
     }
@@ -1445,7 +1604,8 @@ mod tests {
                 boot: BootState::Booted,
                 uptime_s: 5,
                 network: String::try_from("qemu 10.0.2.15").unwrap(),
-                readings: Default::default(),
+                readings: self.readings.clone(),
+                zones: self.zone_status.iter().copied().collect(),
                 heating: false,
                 heat_request: false,
                 heating_reason: "no sensor reading",
@@ -1465,6 +1625,9 @@ mod tests {
         }
         fn zones<R>(&mut self, f: impl FnOnce(&mut crate::zones::Group) -> R) -> R {
             f(&mut self.group)
+        }
+        fn zone_count(&self) -> usize {
+            self.zone_count.max(1)
         }
         fn inject_reading(&mut self, addr: [u8; 6], temperature_cc: i16) -> bool {
             self.injected = Some((addr, temperature_cc));
@@ -1708,6 +1871,127 @@ mod tests {
             assert!(r.text().ends_with("</html>"), "{path} truncated");
             assert!(!r.text().contains("<<"));
         }
+        // Worst case: a dual board with four named sensors, all heard nearby.
+        p.zone_count = 2;
+        p.zone_status = std::vec![Default::default(); 2];
+        let mut t = crate::ble::BleTable::new();
+        for i in 0..crate::settings::MAX_TEMP_SENSORS as u8 {
+            let addr = [0xC0 | i; 6];
+            t.inject(addr, 2000, 0);
+            let _ = p.settings.temp_sensors.push(crate::settings::TempSensor {
+                addr,
+                setpoint_dc: 200,
+                name: crate::settings::SensorName::try_from("<".repeat(16).as_str()).unwrap(),
+                zone: i % 2,
+            });
+        }
+        p.ble = Some(t);
+        p.settings.zone_names = core::array::from_fn(|_| {
+            crate::settings::ZoneName::try_from("<".repeat(16).as_str()).unwrap()
+        });
+        for path in ["/", "/settings"] {
+            let r = get(&mut p, path, &cookie);
+            assert!(
+                r.text().ends_with("</html>"),
+                "dual {path} truncated ({} bytes)",
+                r.text().len()
+            );
+        }
+    }
+
+    #[test]
+    fn dual_zone_settings_and_status() {
+        use crate::platform::ZoneStatus;
+        let (mut p, cookie) = provisioned();
+        p.zone_count = 2;
+        p.settings.heater_id = crate::settings::str32("leftover");
+        let mut t = crate::ble::BleTable::new();
+        let (a, b) = ([0xA1; 6], [0xB2; 6]);
+        t.inject(a, 1900, 1000);
+        t.inject(b, 2200, 1000);
+        p.ble = Some(t);
+
+        let html = get(&mut p, "/settings", &cookie).text();
+        assert!(html.contains("<legend>Zones</legend>") && html.contains("name=zone1"));
+        assert!(
+            !html.contains("Heater group"),
+            "no heater group on a dual board"
+        );
+        assert!(html.contains("<select name=zn_A1A1A1A1A1A1><option value=0 selected>Zone 1"));
+
+        let base = "hostname=t&ssid=&setpoint=20.0&hysteresis=0.5&heater_id=boiler";
+        let form = std::format!(
+            "{base}&zone0=Downstairs&zone1=+Up+stairs+&sensor=A1%3AA1%3AA1%3AA1%3AA1%3AA1\
+&sensor=B2%3AB2%3AB2%3AB2%3AB2%3AB2&zn_B2B2B2B2B2B2=1"
+        );
+        assert!(
+            post(&mut p, "/settings", &cookie, form.as_bytes())
+                .text()
+                .contains("Saved")
+        );
+        assert_eq!(p.settings.zone_names[0], "Downstairs");
+        assert_eq!(p.settings.zone_names[1], "Up stairs");
+        assert!(
+            p.settings.heater_id.is_empty(),
+            "heater groups are off on dual boards"
+        );
+        let zones: std::vec::Vec<_> = p.settings.temp_sensors.iter().map(|t| t.zone).collect();
+        assert_eq!(zones, [0, 1]);
+        let html = get(&mut p, "/settings", &cookie).text();
+        assert!(
+            html.contains("<option value=1 selected>Up stairs</option>"),
+            "{html}"
+        );
+        // A zone this board does not have is refused.
+        let bad = std::format!("{base}&sensor=A1%3AA1%3AA1%3AA1%3AA1%3AA1&zn_A1A1A1A1A1A1=2");
+        assert!(
+            post(&mut p, "/settings", &cookie, bad.as_bytes())
+                .text()
+                .contains("Invalid zone")
+        );
+        let long = std::format!("{base}&zone0={}", "x".repeat(17));
+        assert!(
+            post(&mut p, "/settings", &cookie, long.as_bytes())
+                .text()
+                .contains("at most 16")
+        );
+
+        // Status: one row per zone with its sensors; JSON lists the zones.
+        p.zone_status = std::vec![
+            ZoneStatus {
+                heating: true,
+                reason: "a sensor is below its setpoint",
+                hold_remaining_s: None,
+            },
+            ZoneStatus {
+                heating: true,
+                reason: "keeping the heater on for its minimum on time",
+                hold_remaining_s: Some(600),
+            },
+        ];
+        let readings =
+            crate::control::readings(p.ble.as_ref().unwrap(), &p.settings.temp_sensors, 2000);
+        p.readings = readings;
+        let html = get(&mut p, "/", &cookie).text();
+        let down = html.find("<tr><td>Downstairs</td>").expect("zone row");
+        let up = html.find("<tr><td>Up stairs</td>").expect("zone row");
+        assert!(down < up);
+        assert!(html[down..up].contains("<code>A1:A1:A1:A1:A1:A1</code> <b>19.0 °C</b>"));
+        assert!(html[up..].contains("0 h 10 min to go") && html[up..].contains("22.0 °C"));
+        let json = get(&mut p, "/api/status", "").text();
+        assert!(
+            json.contains("\"zones\":[{\"name\":\"Downstairs\",\"heating\":true,"),
+            "{json}"
+        );
+        assert!(json.contains("{\"name\":\"Up stairs\",\"heating\":true,\"reason\":\"keeping the heater on for its minimum on time\",\"hold_remaining_s\":600}"));
+        assert!(json.contains("\"addr\":\"B2:B2:B2:B2:B2:B2\",\"name\":\"\",\"zone\":1,"));
+        // Unnamed zones fall back to "Zone N".
+        p.settings.zone_names[1].clear();
+        assert!(
+            get(&mut p, "/api/status", "")
+                .text()
+                .contains("{\"name\":\"Zone 2\"")
+        );
     }
 
     #[test]
@@ -1827,8 +2111,13 @@ mod tests {
             addr: tp,
             setpoint_dc,
             name: Default::default(),
+            zone: 0,
         };
         assert_eq!(p.settings.temp_sensors.as_slice(), &[sensor(200)]);
+        assert!(
+            !html.contains("name=zn_"),
+            "no zone selector on one-zone boards"
+        );
         let html = get(&mut p, "/settings", &cookie).text();
         assert!(html.contains("value=AA:BB:CC:DD:EE:FF checked"));
         assert!(html.contains("name=sp_AABBCCDDEEFF value=20.0"), "{html}");

@@ -22,6 +22,17 @@ pub enum OtaError {
     Flash,
     /// The running image is still on trial; it must confirm itself first.
     NotConfirmed,
+    /// The image was built for a different board (see [`image_board`]).
+    WrongBoard,
+}
+
+/// The board an image was built for, from its version string: the text after
+/// the last `@` (e.g. `0.6.0+1a2b3c4@dual`), or `single` when there is none.
+pub fn image_board(version: &str) -> &str {
+    match version.rsplit_once('@') {
+        Some((_, board)) if !board.is_empty() => board,
+        _ => "single",
+    }
 }
 
 impl OtaError {
@@ -33,6 +44,7 @@ impl OtaError {
             OtaError::Invalid => "image failed verification",
             OtaError::Flash => "flash error",
             OtaError::NotConfirmed => "running firmware not yet confirmed",
+            OtaError::WrongBoard => "image is for a different board",
         }
     }
 }
@@ -73,6 +85,9 @@ pub struct DeviceStatus {
     pub network: String<48>,
     /// Fresh readings of the selected sensors, each with its setpoint.
     pub readings: crate::control::Readings,
+    /// Per heating zone (one entry on single-zone boards). The fields above
+    /// (`heating`, `heating_reason`, `hold_remaining_s`) summarise them.
+    pub zones: heapless::Vec<ZoneStatus, { crate::settings::MAX_ZONES }>,
     pub heating: bool,
     /// What this zone tells its heater group: it keeps the heater on. False while
     /// releasing (output still on, waiting for another zone to confirm).
@@ -87,7 +102,20 @@ pub struct DeviceStatus {
     pub time_synced_ago_s: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ZoneStatus {
+    /// Relay on.
+    pub heating: bool,
+    pub reason: &'static str,
+    /// Seconds this zone's relay must still stay on (minimum on time).
+    pub hold_remaining_s: Option<u64>,
+}
+
 pub trait Platform: Ota {
+    /// Heating zones on this board (one relay each).
+    fn zone_count(&self) -> usize {
+        1
+    }
     /// A snapshot of the current settings.
     fn settings(&self) -> Settings;
     fn save_settings(&mut self, settings: Settings) -> Result<(), StoreError>;

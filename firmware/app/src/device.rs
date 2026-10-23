@@ -13,8 +13,11 @@ use heapless::String;
 use thermostat_core::auth::Sessions;
 use thermostat_core::ble::BleTable;
 use thermostat_core::clock::WallClock;
-use thermostat_core::control::{Readings, Thermostat};
-use thermostat_core::platform::{BootState, DeviceStatus, Ota, OtaError, Platform};
+use thermostat_core::control::{Controller, Readings};
+use thermostat_core::platform::{
+    BootState, DeviceStatus, Ota, OtaError, Platform, ZoneStatus, image_board,
+};
+use thermostat_core::settings::MAX_ZONES;
 use thermostat_core::settings::Settings;
 use thermostat_core::store::{SettingsStore, StoreError};
 use thermostat_core::zones::Group;
@@ -44,7 +47,7 @@ pub struct Device {
     pub sessions: Sessions,
     /// Nearby BLE advertisers (filled by the scanner in WiFi builds).
     pub ble: BleTable,
-    pub thermostat: Thermostat,
+    pub heating: Controller,
     pub readings: Readings,
     /// Wall-clock time, set by SNTP.
     pub clock: WallClock,
@@ -77,7 +80,7 @@ impl Device {
             rng: Rng::new(),
             sessions: Sessions::new(),
             ble: BleTable::new(),
-            thermostat: Thermostat::new(),
+            heating: Controller::new(crate::board::ZONES),
             readings: Readings::new(),
             clock: WallClock::new(),
             group: Group::new(),
@@ -123,6 +126,7 @@ fn ota_error(e: UpdateError) -> OtaError {
         UpdateError::Image(_) => OtaError::Invalid,
         UpdateError::Flash => OtaError::Flash,
         UpdateError::NotBooted => OtaError::NotConfirmed,
+        UpdateError::Rejected => OtaError::WrongBoard,
     }
 }
 
@@ -155,10 +159,23 @@ impl Ota for Handle {
     fn ota_finish(&mut self) -> Result<String<32>, OtaError> {
         self.with(|d| {
             d.ota_activity = None;
-            let header = d.updater.finish().map_err(|e| {
-                log::warn!("update rejected: {e:?}");
-                ota_error(e)
-            })?;
+            let header = d
+                .updater
+                .finish_checked(|h| {
+                    let board = image_board(h.version_str());
+                    if board != crate::board::NAME {
+                        log::warn!(
+                            "update {} is for the {board} board; this is the {} board",
+                            h.version_str(),
+                            crate::board::NAME
+                        );
+                    }
+                    board == crate::board::NAME
+                })
+                .map_err(|e| {
+                    log::warn!("update rejected: {e:?}");
+                    ota_error(e)
+                })?;
             log::info!(
                 "update {} staged; swapped in on next boot",
                 header.version_str()
@@ -204,21 +221,38 @@ impl Platform for Handle {
     }
 
     fn status(&mut self) -> DeviceStatus {
-        self.with(|d| DeviceStatus {
-            boot: d.boot,
-            uptime_s: Instant::now().as_secs(),
-            network: d.network.clone(),
-            readings: d.readings.clone(),
-            heating: d.thermostat.heating(),
-            heat_request: d.thermostat.requesting(),
-            heating_reason: d.thermostat.reason.as_str(),
-            hold_remaining_s: d
-                .thermostat
-                .hold_remaining_ms(Instant::now().as_millis())
-                .map(|ms| ms / 1000),
-            unix_time: d.clock.unix_s(Instant::now().as_micros()),
-            time_synced_ago_s: d.clock.since_sync_s(Instant::now().as_micros()),
+        self.with(|d| {
+            let now = Instant::now().as_millis();
+            let zones: heapless::Vec<ZoneStatus, MAX_ZONES> = d
+                .heating
+                .zones()
+                .iter()
+                .map(|z| ZoneStatus {
+                    heating: z.heating(),
+                    reason: z.reason.as_str(),
+                    hold_remaining_s: z.hold_remaining_ms(now).map(|ms| ms / 1000),
+                })
+                .collect();
+            // Summary: the first heating zone (or the first zone) and the longest hold.
+            let lead = zones.iter().find(|z| z.heating).unwrap_or(&zones[0]);
+            DeviceStatus {
+                boot: d.boot,
+                uptime_s: Instant::now().as_secs(),
+                network: d.network.clone(),
+                readings: d.readings.clone(),
+                heating: d.heating.heating(),
+                heat_request: d.heating.requesting(),
+                heating_reason: lead.reason,
+                hold_remaining_s: zones.iter().filter_map(|z| z.hold_remaining_s).max(),
+                zones: zones.clone(),
+                unix_time: d.clock.unix_s(Instant::now().as_micros()),
+                time_synced_ago_s: d.clock.since_sync_s(Instant::now().as_micros()),
+            }
         })
+    }
+
+    fn zone_count(&self) -> usize {
+        crate::board::ZONES
     }
 
     fn request_reboot(&mut self) {

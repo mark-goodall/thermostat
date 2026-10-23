@@ -25,6 +25,8 @@ pub enum UpdateError {
     /// The running firmware has not been marked booted; updating now would
     /// make a revert impossible.
     NotBooted,
+    /// A valid image the caller refused (see [`Updater::finish_checked`]).
+    Rejected,
 }
 
 impl From<FirmwareUpdaterError> for UpdateError {
@@ -162,6 +164,15 @@ impl<'a, M: RawMutex, F: NorFlash> Updater<'a, M, F> {
 
     /// Validate the staged image and schedule it for the next boot.
     pub fn finish(&mut self) -> Result<Header, UpdateError> {
+        self.finish_checked(|_| true)
+    }
+
+    /// Like [`finish`](Self::finish), but the verified image is only staged if
+    /// `accept` approves its header (e.g. it was built for this board).
+    pub fn finish_checked(
+        &mut self,
+        accept: impl FnOnce(&Header) -> bool,
+    ) -> Result<Header, UpdateError> {
         let received = self.next.take().ok_or(UpdateError::Sequence)?;
         if self.carry_len > 0 {
             let mut word = [0xFFu8; 4];
@@ -173,6 +184,9 @@ impl<'a, M: RawMutex, F: NorFlash> Updater<'a, M, F> {
         let header = self.verify_dfu()?;
         if header.total_len() != received {
             return Err(UpdateError::Image(ImageError::TooLarge));
+        }
+        if !accept(&header) {
+            return Err(UpdateError::Rejected);
         }
         self.inner.mark_updated()?;
         Ok(header)

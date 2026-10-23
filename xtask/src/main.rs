@@ -112,6 +112,11 @@ pub struct BuildArgs {
     /// Extra cargo features for the app (comma separated).
     #[arg(long, default_value = "")]
     pub features: String,
+    /// Board: `single` (one relay, GPIO16) or `dual` (two zones, GPIO16 and
+    /// GPIO17). Dual images go to `target/images/<target>-dual/` and carry
+    /// `@dual` in their version, so neither board accepts the other's updates.
+    #[arg(long, default_value = "single", value_parser = ["single", "dual"])]
+    pub board: String,
 }
 
 pub struct Artifacts {
@@ -262,16 +267,37 @@ fn esp_path() -> Option<String> {
 
 pub fn build(args: &BuildArgs) -> Result<Artifacts> {
     let root = workspace_root();
-    let dir = root.join("target/images").join(&args.target);
+    let dual = args.board == "dual";
+    let dir = root.join("target/images").join(if dual {
+        format!("{}-dual", args.target)
+    } else {
+        args.target.clone()
+    });
     std::fs::create_dir_all(&dir)?;
 
     let bl = build_bootloader()?;
 
     let mut features = args.target.clone();
+    if dual {
+        features.push_str(",board-dual");
+    }
     if !args.features.is_empty() {
         features = format!("{features},{}", args.features);
     }
-    let version = args.version.clone().unwrap_or_else(default_version);
+    // The board travels in the version string (`@dual`); see `platform::image_board`.
+    let mut version = args.version.clone().unwrap_or_else(default_version);
+    if version.contains('@') {
+        bail!("the version may not contain '@' (it marks the board)");
+    }
+    if dual {
+        version.push_str("@dual");
+    }
+    if version.len() > embassy_boot_esp::image::VERSION_LEN {
+        bail!(
+            "version {version:?} is longer than {} bytes",
+            embassy_boot_esp::image::VERSION_LEN
+        );
+    }
     let app_elf = cargo_esp(
         "thermostat-firmware",
         args.release,
