@@ -28,7 +28,7 @@ driving the zone relay on GPIO16, with a status LED on GPIO23.
 | 0x1000 | 28 KiB | bootloader |
 | 0x8000 | 4 KiB | partition table (ESP-IDF format, readable by espflash/esptool) |
 | 0x9000 | 8 KiB | `bootstate`: embassy-boot swap progress |
-| 0x10000 | 64 KiB | `settings`: parameter store (WiFi SSID/key, admin login hash, thermostat settings) |
+| 0x10000 | 64 KiB | `settings`: first 32 KiB settings records (WiFi SSID/key, admin login hash, thermostat settings), second 32 KiB sensor schedules. Each half is a wear-levelled record log; firmware from before the split kept settings anywhere in the 64 KiB, and the first boot of newer firmware moves the newest record into the first half. |
 | 0x20000 | 1.75 MiB | `active`: running application (executed in place) |
 | 0x1E0000 | 1.75 MiB + 4 KiB | `dfu`: staged update, and the previous image after a swap |
 
@@ -109,6 +109,26 @@ Supported sensors:
 | ThermoPro TP357/TP357S/TP35x/TP39x | manufacturer data (company-ID field reused) | recognised by the frame format: `C2` marker, length, trailer bytes, plausible values. A name, if heard, also confirms it. Works with passive scanning. |
 | Xiaomi LYWSD03MMC etc. with pvvx/ATC firmware | service data `0x181A` | |
 | any BTHome v2 device (unencrypted) | service data `0xFCD2` | |
+
+## Schedules and boost
+
+- **Schedules.** Each selected sensor can follow a schedule instead of its
+  fixed setpoint: one setpoint per hour, one row for Monday-Friday and one for
+  Saturday-Sunday, 5.0-32.5 °C in 0.5 °C steps. Edit it from the sensor's
+  "Schedule" link on the settings page (`/schedule?sensor=AABBCCDDEEFF`), or
+  through `GET/POST /api/schedule?sensor=…` (form fields `on`, `d0`-`d23`,
+  `e0`-`e23`; leaving out `on` turns the schedule off). Hours are local time
+  (timezone setting); until NTP time is known the fixed setpoint applies. The
+  status page and `/api/status` (`"scheduled": true`) show the setpoint in force.
+- **Storage.** A schedule is one byte per hour: 48 bytes per sensor, at most
+  432 bytes for eight sensors. Schedules are stored in their own record log (the
+  second half of the settings partition, see "Flash layout") and the device
+  keeps the only copy in RAM; the web pages handle one sensor at a time.
+- **Boost.** The Boost button next to a zone on the status page (or `POST
+  /api/boost` with `zone=N`; `on=0` cancels) heats that zone for an hour
+  whatever its sensors say, even without a reading. Afterwards normal control
+  resumes, minimum on time included, so the heater may run on past the hour.
+  A boost lasts until it ends, is cancelled, or the thermostat restarts.
 
 ## Two-zone board
 

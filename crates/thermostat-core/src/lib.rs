@@ -14,6 +14,7 @@ pub mod dhcp;
 pub mod http;
 pub mod platform;
 pub mod proto;
+pub mod schedule;
 pub mod settings;
 pub mod sntp;
 pub mod store;

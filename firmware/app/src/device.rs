@@ -15,11 +15,12 @@ use thermostat_core::ble::BleTable;
 use thermostat_core::clock::WallClock;
 use thermostat_core::control::{Controller, Readings};
 use thermostat_core::platform::{
-    BootState, DeviceStatus, Ota, OtaError, Platform, ZoneStatus, image_board,
+    BootState, DeviceStatus, Ota, OtaError, Platform, ScheduleSaveError, ZoneStatus, image_board,
 };
+use thermostat_core::schedule::{Schedule, Schedules};
 use thermostat_core::settings::MAX_ZONES;
 use thermostat_core::settings::Settings;
-use thermostat_core::store::{SettingsStore, StoreError};
+use thermostat_core::store::{ScheduleStore, SettingsStore, StoreError};
 use thermostat_core::zones::Group;
 
 pub const VERSION: &str = match option_env!("THERMOSTAT_VERSION") {
@@ -38,10 +39,18 @@ pub type FirmwareUpdater = Updater<'static, CriticalSectionRawMutex, FlashStorag
 /// An abandoned transfer (client vanished) stops blocking new ones after this.
 const OTA_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Sensor schedules: the only copy in RAM, and where they are stored.
+pub struct ScheduleState {
+    pub schedules: Schedules,
+    pub store: ScheduleStore,
+    pub flash: FlashPartition,
+}
+
 pub struct Device {
     pub settings: Settings,
     pub store: SettingsStore,
     pub settings_flash: FlashPartition,
+    pub schedule: ScheduleState,
     pub updater: FirmwareUpdater,
     pub rng: Rng,
     pub sessions: Sessions,
@@ -64,6 +73,7 @@ impl Device {
         settings: Settings,
         store: SettingsStore,
         settings_flash: FlashPartition,
+        schedule: ScheduleState,
         mut updater: FirmwareUpdater,
     ) -> Self {
         let boot = match updater.status() {
@@ -76,6 +86,7 @@ impl Device {
             settings,
             store,
             settings_flash,
+            schedule,
             updater,
             rng: Rng::new(),
             sessions: Sessions::new(),
@@ -231,6 +242,7 @@ impl Platform for Handle {
                     heating: z.heating(),
                     reason: z.reason.as_str(),
                     hold_remaining_s: z.hold_remaining_ms(now).map(|ms| ms / 1000),
+                    boost_remaining_s: z.boost_remaining_ms(now).map(|ms| ms.div_ceil(1000)),
                 })
                 .collect();
             // Summary: the first heating zone (or the first zone) and the longest hold.
@@ -254,6 +266,50 @@ impl Platform for Handle {
 
     fn zone_count(&self) -> usize {
         crate::board::ZONES
+    }
+
+    fn boost(&mut self, zone: usize, on: bool) -> bool {
+        let ok = self.with(|d| {
+            let now = Instant::now().as_millis();
+            match d.heating.zones_mut().get_mut(zone) {
+                Some(z) if on => z.boost(now, thermostat_core::platform::BOOST_MS),
+                Some(z) => z.cancel_boost(),
+                None => return false,
+            }
+            log::info!(
+                "zone {} boost {}",
+                zone + 1,
+                if on { "started" } else { "cancelled" }
+            );
+            true
+        });
+        if ok {
+            crate::heating::RECHECK.signal(());
+        }
+        ok
+    }
+
+    fn schedule(&mut self, addr: &[u8; 6]) -> Option<Schedule> {
+        self.with(|d| d.schedule.schedules.get(addr).copied())
+    }
+
+    fn save_schedule(
+        &mut self,
+        addr: [u8; 6],
+        schedule: Option<Schedule>,
+    ) -> Result<(), ScheduleSaveError> {
+        let r = self.with(|d| {
+            let selected = &d.settings.temp_sensors;
+            let sc = &mut d.schedule;
+            sc.schedules
+                .set(addr, schedule, |a| selected.iter().any(|t| &t.addr == a))
+                .map_err(|_| ScheduleSaveError::Full)?;
+            sc.store
+                .save(&mut sc.flash, &sc.schedules)
+                .map_err(|_| ScheduleSaveError::Flash)
+        });
+        crate::heating::RECHECK.signal(());
+        r
     }
 
     fn request_reboot(&mut self) {

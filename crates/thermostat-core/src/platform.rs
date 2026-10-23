@@ -111,6 +111,18 @@ pub struct ZoneStatus {
     pub reason: &'static str,
     /// Seconds this zone's relay must still stay on (minimum on time).
     pub hold_remaining_s: Option<u64>,
+    /// Seconds of boost left, while boosted.
+    pub boost_remaining_s: Option<u64>,
+}
+
+/// How long a boost lasts.
+pub const BOOST_MS: u64 = 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleSaveError {
+    /// No room: every slot holds the schedule of a selected sensor.
+    Full,
+    Flash,
 }
 
 pub trait Platform: Ota {
@@ -132,6 +144,24 @@ pub trait Platform: Ota {
     fn ble<R>(&mut self, f: impl FnOnce(Option<&BleTable>) -> R) -> R;
     /// The other zones of this thermostat's heater group.
     fn zones<R>(&mut self, f: impl FnOnce(&mut Group) -> R) -> R;
+    /// Boost a zone (heat for [`BOOST_MS`] whatever the sensors say), or with
+    /// `on` false cancel its boost. Returns false for a zone the board lacks.
+    fn boost(&mut self, _zone: usize, _on: bool) -> bool {
+        false
+    }
+    /// One sensor's schedule (a copy), if it has one. The device keeps the
+    /// only full set.
+    fn schedule(&mut self, _addr: &[u8; 6]) -> Option<crate::schedule::Schedule> {
+        None
+    }
+    /// Set (or with `None` remove) a sensor's schedule and store all schedules.
+    fn save_schedule(
+        &mut self,
+        _addr: [u8; 6],
+        _schedule: Option<crate::schedule::Schedule>,
+    ) -> Result<(), ScheduleSaveError> {
+        Err(ScheduleSaveError::Flash)
+    }
     /// Test builds (emulator) only: inject a sensor reading. Returns false if unsupported.
     fn inject_reading(&mut self, _addr: [u8; 6], _temperature_cc: i16) -> bool {
         false

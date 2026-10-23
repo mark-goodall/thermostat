@@ -53,6 +53,8 @@ pub struct SensorReading {
     pub setpoint_dc: i16,
     /// Heating zone the sensor belongs to.
     pub zone: u8,
+    /// `setpoint_dc` comes from the sensor's schedule (see [`apply_schedules`]).
+    pub scheduled: bool,
 }
 
 impl SensorReading {
@@ -89,9 +91,26 @@ pub fn readings(table: &BleTable, selected: &[TempSensor], now_ms: u64) -> Readi
             temperature_cc: t as i32,
             setpoint_dc: sel.setpoint_dc,
             zone: sel.zone,
+            scheduled: false,
         });
     }
     out
+}
+
+/// Give each reading with a schedule its scheduled setpoint for local time
+/// `local`. Without the time (no NTP yet) the fixed setpoints stay.
+pub fn apply_schedules(
+    readings: &mut [SensorReading],
+    schedules: &crate::schedule::Schedules,
+    local: Option<&crate::clock::DateTime>,
+) {
+    let Some(local) = local else { return };
+    for r in readings {
+        if let Some(s) = schedules.get(&r.addr) {
+            r.setpoint_dc = s.setpoint_dc(local);
+            r.scheduled = true;
+        }
+    }
 }
 
 /// Average of the readings in tenths of a degree (for display).
@@ -115,6 +134,8 @@ pub enum Reason {
     /// Warm enough, and another zone seems to be heating: asking the group to
     /// confirm before switching off (see [`Thermostat::released`]).
     Releasing,
+    /// Boosted: heating on for a while whatever the sensors say.
+    Boost,
 }
 
 /// The rest of the heater group, as seen by this zone (see `zones`).
@@ -147,6 +168,8 @@ pub struct Thermostat {
     /// the number identifies the request.
     releasing: Option<u32>,
     release_seq: u32,
+    /// While boosted: when the boost ends (monotonic ms).
+    boost_until_ms: Option<u64>,
     pub reason: Reason,
 }
 
@@ -166,8 +189,27 @@ impl Thermostat {
             hold_until_ms: None,
             releasing: None,
             release_seq: 0,
+            boost_until_ms: None,
             reason: Reason::NoReading,
         }
+    }
+
+    /// Heat for `duration_ms` from now whatever the sensors say (applied at the
+    /// next update). Afterwards normal control resumes, including the minimum
+    /// on time, so the heater may run on past the boost.
+    pub fn boost(&mut self, now_ms: u64, duration_ms: u64) {
+        self.boost_until_ms = Some(now_ms + duration_ms);
+    }
+
+    pub fn cancel_boost(&mut self) {
+        self.boost_until_ms = None;
+    }
+
+    /// Milliseconds of boost left, while boosted.
+    pub fn boost_remaining_ms(&self, now_ms: u64) -> Option<u64> {
+        self.boost_until_ms
+            .filter(|&t| t > now_ms)
+            .map(|t| t - now_ms)
     }
 
     /// Whether the heat output is on.
@@ -240,14 +282,22 @@ impl Thermostat {
         now_ms: u64,
     ) -> bool {
         self.hold_until_ms = None;
-        if readings.is_empty() {
+        let boosting = self.boost_remaining_ms(now_ms).is_some();
+        if !boosting {
+            self.boost_until_ms = None;
+        }
+        // Without readings heating stops at once, unless boosted (a boost is
+        // short and explicitly asked for).
+        if readings.is_empty() && !boosting {
             self.reason = Reason::NoReading;
             self.heating = false;
             self.releasing = None;
             return false;
         }
         let band = |b| readings.iter().filter(move |r| r.band(hysteresis_dc) == b);
-        let (want, reason) = if band(Band::Below).next().is_some() {
+        let (want, reason) = if boosting {
+            (true, Reason::Boost)
+        } else if band(Band::Below).next().is_some() {
             (true, Reason::BelowBand)
         } else if band(Band::Above).count() == readings.len() {
             (false, Reason::AboveBand)
@@ -404,6 +454,7 @@ impl Reason {
             Reason::InBand => "within hysteresis band",
             Reason::MinOnTime => "keeping the heater on for its minimum on time",
             Reason::Releasing => "checking that another zone keeps the heater on",
+            Reason::Boost => "boost",
         }
     }
 }
@@ -434,6 +485,7 @@ mod tests {
             temperature_cc: t_cc,
             setpoint_dc,
             zone,
+            scheduled: false,
         }
     }
 
@@ -534,6 +586,64 @@ mod tests {
             s,
             min
         ));
+    }
+
+    #[test]
+    fn schedules_replace_fixed_setpoints_when_the_time_is_known() {
+        use crate::schedule::{Schedule, Schedules, step_from_dc};
+        let mut all = Schedules::new();
+        let mut s = Schedule::flat(170);
+        s.weekday[7] = step_from_dc(215).unwrap();
+        all.set([1; 6], Some(s), |_| true).unwrap();
+        let mut r = [reading(1, 2000, 200), reading(2, 2000, 200)];
+        apply_schedules(&mut r, &all, None);
+        assert_eq!(
+            (r[0].setpoint_dc, r[0].scheduled),
+            (200, false),
+            "no clock yet"
+        );
+        let friday_7 = crate::clock::DateTime::from_unix(1_792_738_800, 0, false); // 2026-10-23 07:00Z
+        assert_eq!((friday_7.weekday, friday_7.hour), (5, 7));
+        apply_schedules(&mut r, &all, Some(&friday_7));
+        assert_eq!((r[0].setpoint_dc, r[0].scheduled), (215, true));
+        assert_eq!(
+            (r[1].setpoint_dc, r[1].scheduled),
+            (200, false),
+            "no schedule"
+        );
+        // 20.0 against a scheduled 21.5 (hysteresis 1.0): heat.
+        let mut th = Thermostat::new();
+        assert!(th.update(&r[..1], 10, 0, GroupState::STANDALONE, 0));
+    }
+
+    #[test]
+    fn boost_heats_for_its_time_then_normal_control_resumes() {
+        let hour = 3_600_000;
+        let min = 2 * hour;
+        let s = GroupState::STANDALONE;
+        let mut th = Thermostat::new();
+        // Warm room, no heat; a boost turns it on regardless.
+        assert!(!th.update(&room(2200), 10, min, s, 0));
+        th.boost(1_000, hour);
+        assert!(th.update(&room(2200), 10, min, s, 2_000));
+        assert_eq!(th.reason, Reason::Boost);
+        assert!(th.take_heater_started());
+        assert_eq!(th.boost_remaining_ms(2_000), Some(hour - 1_000));
+        // Even without sensor readings while it lasts.
+        assert!(th.update(&[], 10, min, s, 30 * 60_000));
+        // After the hour the minimum on time (2 h, counted from the boost) holds it.
+        assert!(th.update(&room(2200), 10, min, s, hour + 1_000));
+        assert_eq!(th.reason, Reason::MinOnTime);
+        assert_eq!(th.boost_remaining_ms(hour + 1_000), None);
+        assert!(
+            !th.update(&room(2200), 10, min, s, 2_000 + min),
+            "2 h from the heater start"
+        );
+        // Cancelling ends it at the next update (here the minimum on time is off).
+        th.boost(10 * hour, hour);
+        assert!(th.update(&room(2200), 10, 0, s, 10 * hour));
+        th.cancel_boost();
+        assert!(!th.update(&room(2200), 10, 0, s, 10 * hour + 1));
     }
 
     #[test]

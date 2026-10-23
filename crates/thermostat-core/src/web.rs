@@ -10,6 +10,9 @@
 //! | `GET  /update`     | yes   | firmware upload page                      |
 //! | `POST /api/update` | yes   | raw image body; `?reboot=0` to stay up    |
 //! | `POST /api/reboot` | yes   |                                           |
+//! | `GET/POST /schedule?sensor=` | yes | one sensor's weekday/weekend schedule |
+//! | `GET/POST /api/schedule?sensor=` | yes | the same as JSON / form         |
+//! | `POST /boost`, `/api/boost` | yes | `zone=N` (`on=0` cancels): heat for an hour |
 //! | `GET  /api/status` | –     | JSON status                               |
 //! | `GET  /ble`        | yes   | nearby BLE advertisers (auto-refreshing)  |
 //! | `GET  /api/zone`   | –     | this zone and its heater group (JSON)     |
@@ -35,9 +38,12 @@ use crate::settings::{Settings, Str32};
 /// Scratch space a connection needs (request head + response page).
 pub const BUF_LEN: usize = http::MAX_HEAD + PAGE_LEN;
 // The worst case (dual board, eight sensors, 16-byte names made entirely of
-// HTML-escaped characters) renders the settings page in about 9.5 KiB.
-const PAGE_LEN: usize = 10 * 1024;
-const MAX_FORM: usize = 1024;
+// HTML-escaped characters) renders the settings page in about 10 KiB.
+const PAGE_LEN: usize = 11 * 1024;
+/// Largest form body. Forms are read into the page buffer, which is free
+/// until the response is rendered.
+const MAX_FORM: usize = 4096;
+const _: () = assert!(MAX_FORM <= PAGE_LEN);
 
 enum Auth {
     None,
@@ -99,10 +105,11 @@ pub async fn handle<S: Read + Write, P: Platform>(
                         json_str(w, s.temp_sensor(&r.addr).map_or("", |t| t.name.as_str()))?;
                         write!(
                             w,
-                            ",\"zone\":{},\"temperature\":{},\"setpoint\":{},\"band\":\"{}\"}}",
+                            ",\"zone\":{},\"temperature\":{},\"setpoint\":{},\"scheduled\":{},\"band\":\"{}\"}}",
                             r.zone,
                             Tenths(crate::control::cc_to_dc(r.temperature_cc) as i32),
                             Tenths(r.setpoint_dc as i32),
+                            r.scheduled,
                             r.band(s.hysteresis_dc).as_str()
                         )?;
                     }
@@ -125,8 +132,12 @@ pub async fn handle<S: Read + Write, P: Platform>(
                             z.heating, z.reason
                         )?;
                         match z.hold_remaining_s {
-                            Some(h) => write!(w, "{h}}}")?,
-                            None => w.write_str("null}")?,
+                            Some(h) => write!(w, "{h}")?,
+                            None => w.write_str("null")?,
+                        }
+                        match z.boost_remaining_s {
+                            Some(b) => write!(w, ",\"boost_remaining_s\":{b}}}")?,
+                            None => w.write_str(",\"boost_remaining_s\":null}")?,
                         }
                     }
                     write!(
@@ -167,8 +178,7 @@ pub async fn handle<S: Read + Write, P: Platform>(
             .await
         }
         (Method::Post, "/api/zone/event") => {
-            let mut form = [0u8; MAX_FORM];
-            let body = read_form(sock, &req, body_prefix, &mut form).await?;
+            let body = read_form(sock, &req, body_prefix, &mut page_buf[..MAX_FORM]).await?;
             let now_unix = p.status().unix_time;
             match crate::zones::ZoneMessage::decode(
                 body,
@@ -206,8 +216,7 @@ pub async fn handle<S: Read + Write, P: Platform>(
             page(sock, page_buf, "Setup", false, |w| setup_form(w, None)).await
         }
         (Method::Post, "/setup") => {
-            let mut form = [0u8; MAX_FORM];
-            let form = read_form(sock, &req, body_prefix, &mut form).await?;
+            let form = read_form(sock, &req, body_prefix, &mut page_buf[..MAX_FORM]).await?;
             let user: Str32 = http::form_field(form, "user").unwrap_or_default();
             let pass: String<64> = http::form_field(form, "password").unwrap_or_default();
             let pass2: String<64> = http::form_field(form, "password2").unwrap_or_default();
@@ -229,8 +238,7 @@ pub async fn handle<S: Read + Write, P: Platform>(
             page(sock, page_buf, "Login", false, |w| login_form(w, None)).await
         }
         (Method::Post, "/login") => {
-            let mut form = [0u8; MAX_FORM];
-            let form = read_form(sock, &req, body_prefix, &mut form).await?;
+            let form = read_form(sock, &req, body_prefix, &mut page_buf[..MAX_FORM]).await?;
             let user: Str32 = http::form_field(form, "user").unwrap_or_default();
             let pass: String<64> = http::form_field(form, "password").unwrap_or_default();
             if check_credentials(&s, &user, &pass) {
@@ -281,14 +289,14 @@ pub async fn handle<S: Read + Write, P: Platform>(
             let now = p.now_ms();
             let found = sensor_candidates(p);
             let zones = p.zone_count();
+            let scheduled = scheduled_sensors(p, &s);
             page(sock, page_buf, "Settings", true, |w| {
-                settings_form(w, &s, zones, None, &found, now)
+                settings_form(w, &s, zones, &scheduled, None, &found, now)
             })
             .await
         }
         (Method::Post, "/settings") => {
-            let mut form = [0u8; MAX_FORM];
-            let form = read_form(sock, &req, body_prefix, &mut form).await?;
+            let form = read_form(sock, &req, body_prefix, &mut page_buf[..MAX_FORM]).await?;
             let msg = match apply_settings(p, &mut s, form) {
                 Ok(()) => match p.save_settings(&s) {
                     Ok(()) => Notice::Ok("Saved. Network changes apply after a reboot."),
@@ -303,8 +311,9 @@ pub async fn handle<S: Read + Write, P: Platform>(
             let now = p.now_ms();
             let found = sensor_candidates(p);
             let zones = p.zone_count();
+            let scheduled = scheduled_sensors(p, &s);
             page(sock, page_buf, "Settings", true, |w| {
-                settings_form(w, &s, zones, Some(msg), &found, now)
+                settings_form(w, &s, zones, &scheduled, Some(msg), &found, now)
             })
             .await
         }
@@ -359,8 +368,7 @@ pub async fn handle<S: Read + Write, P: Platform>(
             }
         }
         (Method::Post, "/api/test/sensor") => {
-            let mut form = [0u8; MAX_FORM];
-            let form = read_form(sock, &req, body_prefix, &mut form).await?;
+            let form = read_form(sock, &req, body_prefix, &mut page_buf[..MAX_FORM]).await?;
             let addr =
                 http::form_field::<24>(form, "addr").and_then(|a| crate::ble::parse_addr(&a));
             let temp = http::form_field::<8>(form, "temp").and_then(|t| http::parse_tenths(&t));
@@ -383,6 +391,61 @@ pub async fn handle<S: Read + Write, P: Platform>(
                     )
                     .await
                 }
+            }
+        }
+        (Method::Post, "/boost" | "/api/boost") => {
+            let form = read_form(sock, &req, body_prefix, &mut page_buf[..MAX_FORM]).await?;
+            let zone = http::form_value(form, "zone").and_then(|z| z.parse::<usize>().ok());
+            let on = http::form_value(form, "on") != Some("0");
+            let ok = zone.is_some_and(|z| p.boost(z, on));
+            if !req.path.starts_with("/api/") {
+                redirect(sock, page_buf, "/", None).await
+            } else if ok {
+                respond(sock, page_buf, 200, "application/json", &[], |w| {
+                    w.write_str("{\"ok\":true}")
+                })
+                .await
+            } else {
+                error(sock, page_buf, 400, "unknown zone").await
+            }
+        }
+        (method, "/schedule" | "/api/schedule") => {
+            let api = req.path.starts_with("/api/");
+            let addr = req.query_value("sensor").and_then(sensor_param);
+            let Some(t) = addr.and_then(|a| s.temp_sensor(&a)).cloned() else {
+                return error(sock, page_buf, 404, "not a selected sensor").await;
+            };
+            let mut notice = None;
+            if method == Method::Post {
+                let form = read_form(sock, &req, body_prefix, &mut page_buf[..MAX_FORM]).await?;
+                let saved = parse_schedule(form).and_then(|sched| {
+                    p.save_schedule(t.addr, sched).map_err(|e| match e {
+                        crate::platform::ScheduleSaveError::Full => "No room for another schedule.",
+                        crate::platform::ScheduleSaveError::Flash => {
+                            "Could not write the schedule to flash."
+                        }
+                    })
+                });
+                if let Err(msg) = saved {
+                    if api {
+                        return error(sock, page_buf, 400, msg).await;
+                    }
+                    notice = Some(Notice::Err(msg));
+                } else {
+                    notice = Some(Notice::Ok("Schedule saved."));
+                }
+            }
+            let sched = p.schedule(&t.addr);
+            if api {
+                respond(sock, page_buf, 200, "application/json", &[], |w| {
+                    schedule_json(w, &t, sched.as_ref())
+                })
+                .await
+            } else {
+                page(sock, page_buf, "Schedule", true, |w| {
+                    schedule_page(w, &s, &t, sched.as_ref(), notice)
+                })
+                .await
             }
         }
         (Method::Post, "/api/reboot") => {
@@ -629,10 +692,10 @@ async fn read_form<'b, S: Read>(
     sock: &mut S,
     req: &Request<'_>,
     prefix: &[u8],
-    buf: &'b mut [u8; MAX_FORM],
+    buf: &'b mut [u8],
 ) -> Result<&'b str, HttpError> {
     let len = req.content_length;
-    if len > MAX_FORM || prefix.len() > len {
+    if len > buf.len() || prefix.len() > len {
         return Err(HttpError::Malformed);
     }
     buf[..prefix.len()].copy_from_slice(prefix);
@@ -799,7 +862,8 @@ main{max-width:34em;margin:1em auto;background:#fff;padding:1em 1.5em;border-rad
 label{display:block;margin:.6em 0 .2em}input{width:100%;padding:.4em;box-sizing:border-box}\
 button{margin-top:1em;padding:.4em 1em}fieldset{margin:1em 0;border:1px solid #ccc}\
 .ok{background:#dfd;padding:.5em}.err{background:#fdd;padding:.5em}td{padding:.2em .8em .2em 0}\
-input[type=checkbox]{width:auto}.s{margin-left:2em}";
+input[type=checkbox]{width:auto}.s{margin-left:2em}.b{display:inline;margin:0}\
+.b button{margin:0 0 0 .6em;padding:.1em .6em}.h input{width:4.5em}";
 
 enum Notice {
     Ok(&'static str),
@@ -862,7 +926,9 @@ fn status_page(
                 zs.reason
             )?;
             hold_text(w, zs.hold_remaining_s)?;
+            boost_text(w, zs.boost_remaining_s)?;
             w.write_str(")</small>")?;
+            boost_button(w, z, zs)?;
             let mut any = false;
             for t in s.temp_sensors.iter().filter(|t| t.zone as usize == z) {
                 any = true;
@@ -890,8 +956,39 @@ fn status_page(
         st.heating_reason
     )?;
     hold_text(w, st.hold_remaining_s)?;
-    w.write_str(")</small></td></tr>")?;
+    if let Some(zs) = st.zones.first() {
+        boost_text(w, zs.boost_remaining_s)?;
+        w.write_str(")</small>")?;
+        boost_button(w, 0, zs)?;
+    } else {
+        w.write_str(")</small>")?;
+    }
+    w.write_str("</td></tr>")?;
     status_tail(w, s, st, zone)
+}
+
+fn boost_text(w: &mut BufWriter<'_>, boost_s: Option<u64>) -> core::fmt::Result {
+    match boost_s {
+        Some(b) => write!(w, ", {} min left", b.div_ceil(60)),
+        None => Ok(()),
+    }
+}
+
+/// "Boost 1 h" (or "Cancel boost") for a zone.
+fn boost_button(
+    w: &mut BufWriter<'_>,
+    zone: usize,
+    zs: &crate::platform::ZoneStatus,
+) -> core::fmt::Result {
+    let (on, label) = match zs.boost_remaining_s {
+        Some(_) => (0, "Cancel boost"),
+        None => (1, "Boost 1 h"),
+    };
+    write!(
+        w,
+        "<form method=post action=/boost class=b><input type=hidden name=zone value={zone}>\
+<button name=on value={on}>{label}</button></form>"
+    )
 }
 
 fn hold_text(w: &mut BufWriter<'_>, hold_s: Option<u64>) -> core::fmt::Result {
@@ -914,9 +1011,10 @@ fn sensor_line(
         match st.readings.iter().find(|r| r.addr == t.addr) {
             Some(r) => write!(
                 w,
-                "<b>{} °C</b> · setpoint {} °C · {}",
+                "<b>{} °C</b> · setpoint {} °C{} · {}",
                 Tenths(crate::control::cc_to_dc(r.temperature_cc) as i32),
-                Tenths(t.setpoint_dc as i32),
+                Tenths(r.setpoint_dc as i32),
+                if r.scheduled { " (schedule)" } else { "" },
                 r.band(s.hysteresis_dc).as_str()
             )?,
             None => write!(
@@ -1002,6 +1100,119 @@ fn sensor_candidates<P: Platform>(p: &mut P) -> Candidates {
     p.ble(|t| t.map(|t| t.sorted()).unwrap_or_default())
 }
 
+/// `sensor=` query value: `AABBCCDDEEFF` or `AA:BB:CC:DD:EE:FF` (maybe %-encoded).
+fn sensor_param(raw: &str) -> Option<[u8; 6]> {
+    let text: String<40> = http::url_decode(raw)?;
+    let hex: String<12> = text.chars().filter(|c| *c != ':').collect();
+    if hex.len() != 12 {
+        return None;
+    }
+    let mut colon = String::<17>::new();
+    for (i, c) in hex.chars().enumerate() {
+        if i > 0 && i % 2 == 0 {
+            colon.push(':').ok()?;
+        }
+        colon.push(c).ok()?;
+    }
+    crate::ble::parse_addr(&colon)
+}
+
+/// The sensor's address as the `sensor=` value used in links.
+fn sensor_hex(addr: &[u8; 6]) -> String<12> {
+    let mut f = String::new();
+    for b in addr.iter().rev() {
+        let _ = write!(f, "{b:02X}");
+    }
+    f
+}
+
+/// A schedule form: `on` (checkbox; absent = no schedule), `d0`..`d23`
+/// (weekdays) and `e0`..`e23` (weekend), each 5.0-32.5 in 0.5 steps.
+fn parse_schedule(form: &str) -> Result<Option<crate::schedule::Schedule>, &'static str> {
+    use crate::schedule::{HOURS, Schedule, step_from_dc};
+    if http::form_value(form, "on").is_none() {
+        return Ok(None);
+    }
+    let mut sched = Schedule {
+        weekday: [0; HOURS],
+        weekend: [0; HOURS],
+    };
+    for h in 0..HOURS {
+        for (row, prefix) in [(&mut sched.weekday, 'd'), (&mut sched.weekend, 'e')] {
+            let mut key = String::<4>::new();
+            let _ = write!(key, "{prefix}{h}");
+            let text: String<8> = http::form_value(form, &key)
+                .and_then(http::url_decode)
+                .ok_or("Every hour needs a setpoint.")?;
+            row[h] = http::parse_tenths(text.trim())
+                .and_then(|dc| i16::try_from(dc).ok())
+                .and_then(step_from_dc)
+                .ok_or("Setpoints must be 5.0-32.5 °C in 0.5 °C steps.")?;
+        }
+    }
+    Ok(Some(sched))
+}
+
+fn schedule_json(
+    w: &mut BufWriter<'_>,
+    t: &crate::settings::TempSensor,
+    sched: Option<&crate::schedule::Schedule>,
+) -> core::fmt::Result {
+    let flat = crate::schedule::Schedule::flat(t.setpoint_dc);
+    let shown = sched.unwrap_or(&flat);
+    write!(
+        w,
+        "{{\"sensor\":\"{}\",\"enabled\":{},\"setpoint\":{}",
+        crate::ble::format_addr(&t.addr),
+        sched.is_some(),
+        Tenths(t.setpoint_dc as i32)
+    )?;
+    for (name, row) in [("weekday", &shown.weekday), ("weekend", &shown.weekend)] {
+        write!(w, ",\"{name}\":[")?;
+        for (i, v) in row.iter().enumerate() {
+            let dc = crate::schedule::dc_from_step(*v);
+            write!(w, "{}{}", if i > 0 { "," } else { "" }, Tenths(dc as i32))?;
+        }
+        w.write_str("]")?;
+    }
+    w.write_str("}")
+}
+
+fn schedule_page(
+    w: &mut BufWriter<'_>,
+    s: &Settings,
+    t: &crate::settings::TempSensor,
+    sched: Option<&crate::schedule::Schedule>,
+    n: Option<Notice>,
+) -> core::fmt::Result {
+    notice(w, n)?;
+    w.write_str("<p>")?;
+    sensor_label(w, s, &t.addr)?;
+    write!(
+        w,
+        " · fixed setpoint {} °C</p><form method=post action=/schedule?sensor={}>\
+<label><input type=checkbox name=on{}> Follow this schedule (otherwise the fixed setpoint)</label>\
+<p><small>Local time ({}). 5.0-32.5 °C in 0.5 °C steps. Until the time is known (NTP), \
+the fixed setpoint applies.</small></p><table class=h><tr><th>Hour</th><th>Mon-Fri</th><th>Sat-Sun</th></tr>",
+        Tenths(t.setpoint_dc as i32),
+        sensor_hex(&t.addr),
+        if sched.is_some() { " checked" } else { "" },
+        Escape(&s.timezone)
+    )?;
+    let flat = crate::schedule::Schedule::flat(t.setpoint_dc);
+    let shown = sched.unwrap_or(&flat);
+    for h in 0..crate::schedule::HOURS {
+        write!(
+            w,
+            "<tr><td>{h:02}:00</td><td><input name=d{h} value={} inputmode=decimal></td>\
+<td><input name=e{h} value={} inputmode=decimal></td></tr>",
+            Tenths(crate::schedule::dc_from_step(shown.weekday[h]) as i32),
+            Tenths(crate::schedule::dc_from_step(shown.weekend[h]) as i32)
+        )?;
+    }
+    w.write_str("</table><button>Save</button></form><p><a href=/settings>Back to settings</a></p>")
+}
+
 const SENSOR_LIMIT: &str = "Select at most 8 temperature sensors.";
 const _: () = assert!(
     crate::settings::MAX_TEMP_SENSORS == 8,
@@ -1037,6 +1248,7 @@ fn sensor_inputs(
     w: &mut BufWriter<'_>,
     s: &Settings,
     zones: usize,
+    scheduled: &[[u8; 6]],
     addr: &[u8; 6],
     t: Option<&crate::settings::TempSensor>,
 ) -> core::fmt::Result {
@@ -1064,7 +1276,31 @@ fn sensor_inputs(
         }
         w.write_str("</select></label>")?;
     }
+    if t.is_some() {
+        write!(
+            w,
+            "<a href=/schedule?sensor={}>Schedule: {}</a>",
+            sensor_hex(addr),
+            if scheduled.contains(addr) {
+                "on"
+            } else {
+                "off"
+            }
+        )?;
+    }
     w.write_str("</div>")
+}
+
+/// The selected sensors that follow a schedule.
+fn scheduled_sensors<P: Platform>(
+    p: &mut P,
+    s: &Settings,
+) -> heapless::Vec<[u8; 6], { crate::settings::MAX_TEMP_SENSORS }> {
+    s.temp_sensors
+        .iter()
+        .filter(|t| p.schedule(&t.addr).is_some())
+        .map(|t| t.addr)
+        .collect()
 }
 
 /// `<b>name</b> <code>addr</code>`, or just the address when unnamed.
@@ -1079,6 +1315,7 @@ fn sensor_fieldset(
     w: &mut BufWriter<'_>,
     s: &Settings,
     zones: usize,
+    scheduled: &[[u8; 6]],
     found: &Candidates,
     now: u64,
 ) -> core::fmt::Result {
@@ -1116,7 +1353,7 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
             d.rssi,
             now.saturating_sub(d.sensor_ms) / 1000
         )?;
-        sensor_inputs(w, s, zones, &d.addr, selected)?;
+        sensor_inputs(w, s, zones, scheduled, &d.addr, selected)?;
     }
     for t in &s.temp_sensors {
         if !found.iter().any(|d| d.addr == t.addr) {
@@ -1128,7 +1365,7 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
             )?;
             sensor_label(w, s, &t.addr)?;
             w.write_str(" · not heard recently</label>")?;
-            sensor_inputs(w, s, zones, &t.addr, Some(t))?;
+            sensor_inputs(w, s, zones, scheduled, &t.addr, Some(t))?;
         }
     }
     if !any {
@@ -1141,6 +1378,7 @@ fn settings_form(
     w: &mut BufWriter<'_>,
     s: &Settings,
     zones: usize,
+    scheduled: &[[u8; 6]],
     n: Option<Notice>,
     found: &Candidates,
     now: u64,
@@ -1194,7 +1432,7 @@ while any zone requests heat, and the minimum on time applies to the heater as a
     } else {
         heater_group_fieldset(w, s)?;
     }
-    sensor_fieldset(w, s, zones, found, now)?;
+    sensor_fieldset(w, s, zones, scheduled, found, now)?;
     w.write_str(
         "<fieldset><legend>Admin password</legend>\
 <label>New password (leave empty to keep)<input type=password name=new_password minlength=8 autocomplete=new-password></label>\
@@ -1544,6 +1782,9 @@ mod tests {
         zone_count: usize,
         zone_status: std::vec::Vec<crate::platform::ZoneStatus>,
         readings: crate::control::Readings,
+        schedules: crate::schedule::Schedules,
+        /// (zone, on) per boost request.
+        boosts: std::vec::Vec<(usize, bool)>,
         group: crate::zones::Group,
         injected: Option<([u8; 6], i16)>,
     }
@@ -1614,6 +1855,23 @@ mod tests {
         }
         fn zone_count(&self) -> usize {
             self.zone_count.max(1)
+        }
+        fn boost(&mut self, zone: usize, on: bool) -> bool {
+            self.boosts.push((zone, on));
+            zone < self.zone_count.max(1)
+        }
+        fn schedule(&mut self, addr: &[u8; 6]) -> Option<crate::schedule::Schedule> {
+            self.schedules.get(addr).copied()
+        }
+        fn save_schedule(
+            &mut self,
+            addr: [u8; 6],
+            schedule: Option<crate::schedule::Schedule>,
+        ) -> Result<(), crate::platform::ScheduleSaveError> {
+            let selected = self.settings.temp_sensors.clone();
+            self.schedules
+                .set(addr, schedule, |a| selected.iter().any(|t| &t.addr == a))
+                .map_err(|_| crate::platform::ScheduleSaveError::Full)
         }
         fn inject_reading(&mut self, addr: [u8; 6], temperature_cc: i16) -> bool {
             self.injected = Some((addr, temperature_cc));
@@ -1948,11 +2206,13 @@ mod tests {
                 heating: true,
                 reason: "a sensor is below its setpoint",
                 hold_remaining_s: None,
+                boost_remaining_s: None,
             },
             ZoneStatus {
                 heating: true,
                 reason: "keeping the heater on for its minimum on time",
                 hold_remaining_s: Some(600),
+                boost_remaining_s: Some(1500),
             },
         ];
         let readings =
@@ -1969,7 +2229,7 @@ mod tests {
             json.contains("\"zones\":[{\"name\":\"Downstairs\",\"heating\":true,"),
             "{json}"
         );
-        assert!(json.contains("{\"name\":\"Up stairs\",\"heating\":true,\"reason\":\"keeping the heater on for its minimum on time\",\"hold_remaining_s\":600}"));
+        assert!(json.contains("{\"name\":\"Up stairs\",\"heating\":true,\"reason\":\"keeping the heater on for its minimum on time\",\"hold_remaining_s\":600,\"boost_remaining_s\":1500}"));
         assert!(json.contains("\"addr\":\"B2:B2:B2:B2:B2:B2\",\"name\":\"\",\"zone\":1,"));
         // Unnamed zones fall back to "Zone N".
         p.settings.zone_names[1].clear();
@@ -1978,6 +2238,167 @@ mod tests {
                 .text()
                 .contains("{\"name\":\"Zone 2\"")
         );
+    }
+
+    #[test]
+    fn schedule_page_and_api() {
+        use crate::schedule::{HOURS, step_from_dc};
+        let (mut p, cookie) = provisioned();
+        let addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        p.settings
+            .temp_sensors
+            .push(crate::settings::TempSensor {
+                addr,
+                setpoint_dc: 203,
+                name: crate::settings::SensorName::try_from("Hall").unwrap(),
+                zone: 0,
+            })
+            .unwrap();
+        // Only selected sensors have a schedule page; login needed.
+        assert_eq!(
+            get(&mut p, "/schedule?sensor=112233445566", &cookie).status,
+            404
+        );
+        assert_eq!(get(&mut p, "/schedule?sensor=665544332211", "").status, 303);
+        assert_eq!(
+            get(&mut p, "/api/schedule?sensor=665544332211", "").status,
+            401
+        );
+
+        // No schedule yet: unchecked, prefilled with the fixed setpoint (rounded).
+        let html = get(&mut p, "/schedule?sensor=665544332211", &cookie).text();
+        assert!(
+            html.contains("<b>Hall</b>") && html.contains("fixed setpoint 20.3"),
+            "{html}"
+        );
+        assert!(
+            html.contains("name=on>") && html.contains("name=d7 value=20.5"),
+            "{html}"
+        );
+        assert!(html.ends_with("</html>"));
+        let settings = get(&mut p, "/settings", &cookie).text();
+        assert!(settings.contains("<a href=/schedule?sensor=665544332211>Schedule: off</a>"));
+
+        // Save: 21.0 on weekday mornings, 18.0 otherwise.
+        let mut form = std::string::String::from("on=1");
+        for h in 0..HOURS {
+            let wd = if (6..9).contains(&h) { "21.0" } else { "18.0" };
+            form.push_str(&std::format!("&d{h}={wd}&e{h}=18.5"));
+        }
+        let r = post(
+            &mut p,
+            "/schedule?sensor=66%3A55%3A44%3A33%3A22%3A11",
+            &cookie,
+            form.as_bytes(),
+        );
+        assert!(r.text().contains("Schedule saved."), "{}", r.text());
+        let s = p.schedules.get(&addr).unwrap();
+        assert_eq!(
+            (s.weekday[7], s.weekday[10], s.weekend[0]),
+            (
+                step_from_dc(210).unwrap(),
+                step_from_dc(180).unwrap(),
+                step_from_dc(185).unwrap()
+            )
+        );
+        assert!(
+            get(&mut p, "/schedule?sensor=665544332211", &cookie)
+                .text()
+                .contains("name=on checked")
+        );
+        assert!(
+            get(&mut p, "/settings", &cookie)
+                .text()
+                .contains("Schedule: on</a>")
+        );
+        let json = get(&mut p, "/api/schedule?sensor=665544332211", &cookie).text();
+        assert!(json.starts_with(
+            "{\"sensor\":\"66:55:44:33:22:11\",\"enabled\":true,\"setpoint\":20.3,\"weekday\":[18.0,18.0,18.0,18.0,18.0,18.0,21.0,"
+        ), "{json}");
+
+        // Bad values are refused and change nothing.
+        let bad = form.replace("&d7=21.0", "&d7=21.3");
+        let r = post(
+            &mut p,
+            "/schedule?sensor=665544332211",
+            &cookie,
+            bad.as_bytes(),
+        );
+        assert!(r.text().contains("0.5 °C steps"));
+        let r = post(
+            &mut p,
+            "/schedule?sensor=665544332211",
+            &cookie,
+            b"on=1&d0=20.0",
+        );
+        assert!(r.text().contains("Every hour needs a setpoint"));
+        let auth = std::format!("Basic {}", "YWRtaW46c2VjcmV0MTIz"); // admin:secret123
+        let api_bad = send(
+            &mut p,
+            std::format!(
+                "POST /api/schedule?sensor=665544332211 HTTP/1.1\r\nAuthorization: {auth}\r\nContent-Length: {}\r\n\r\n{}",
+                bad.len(),
+                bad
+            )
+            .into_bytes(),
+        );
+        assert_eq!(api_bad.status, 400);
+        assert_eq!(
+            p.schedules.get(&addr).unwrap().weekday[7],
+            step_from_dc(210).unwrap()
+        );
+
+        // Unchecking removes the schedule (the fixed setpoint applies again).
+        post(&mut p, "/schedule?sensor=665544332211", &cookie, b"d0=20.0");
+        assert!(p.schedules.get(&addr).is_none());
+    }
+
+    #[test]
+    fn boost_buttons_and_api() {
+        use crate::platform::ZoneStatus;
+        let (mut p, cookie) = provisioned();
+        p.zone_status = std::vec![ZoneStatus::default()];
+        let html = get(&mut p, "/", &cookie).text();
+        assert!(
+            html.contains(
+                "<input type=hidden name=zone value=0><button name=on value=1>Boost 1 h</button>"
+            ),
+            "{html}"
+        );
+        let r = post(&mut p, "/boost", &cookie, b"zone=0&on=1");
+        assert_eq!(r.status, 303);
+        assert_eq!(p.boosts, [(0, true)]);
+        // While boosted: time left and a cancel button.
+        p.zone_status[0].boost_remaining_s = Some(3000);
+        p.zone_status[0].heating = true;
+        p.zone_status[0].reason = "boost";
+        let html = get(&mut p, "/", &cookie).text();
+        assert!(
+            html.contains("50 min left") && html.contains("value=0>Cancel boost"),
+            "{html}"
+        );
+        let json = get(&mut p, "/api/status", "").text();
+        assert!(json.contains("\"boost_remaining_s\":3000"), "{json}");
+        // API: Basic auth, unknown zones refused.
+        let api = |p: &mut Fake, body: &str| {
+            send(
+                p,
+                std::format!(
+                    "POST /api/boost HTTP/1.1\r\nAuthorization: Basic YWRtaW46c2VjcmV0MTIz\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes(),
+            )
+        };
+        assert_eq!(api(&mut p, "zone=0&on=0").status, 200);
+        assert_eq!(api(&mut p, "zone=3").status, 400);
+        assert_eq!(p.boosts, [(0, true), (0, false), (3, true)]);
+        assert_eq!(
+            post(&mut p, "/boost", "", b"zone=0").status,
+            303,
+            "login first"
+        );
+        assert_eq!(p.boosts.len(), 3);
     }
 
     #[test]

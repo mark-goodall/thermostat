@@ -36,7 +36,7 @@ use esp_storage::FlashStorage;
 use static_cell::StaticCell;
 use thermostat_core::platform::BootState;
 use thermostat_core::settings::{SETTINGS_SUBTYPE, SETTINGS_TYPE};
-use thermostat_core::store::SettingsStore;
+use thermostat_core::store::ScheduleStore;
 
 use device::{Device, Flash, Handle, Shared, VERSION};
 
@@ -90,25 +90,33 @@ async fn main(spawner: Spawner) -> ! {
     let settings_part =
         partition::find(&table, SETTINGS_TYPE, SETTINGS_SUBTYPE).expect("settings partition");
 
-    let mut settings_flash =
-        BlockingPartition::new(flash, settings_part.offset, settings_part.size);
-    let (store, settings) = match SettingsStore::load(&mut settings_flash) {
-        Ok((store, Some(s))) => {
-            log::info!(
-                "settings loaded: hostname '{}', wifi '{}', setpoint {}",
-                s.hostname,
-                s.wifi_ssid,
-                thermostat_core::http::Tenths(s.setpoint_dc as i32)
-            );
-            (store, s)
-        }
-        Ok((store, None)) => {
-            log::info!("no stored settings; using defaults");
-            (store, Default::default())
-        }
-        Err(e) => panic!("settings partition: {e:?}"),
-    };
+    // First half: settings records; second half: schedules (see `store`).
+    let half = settings_part.size / 2;
+    let mut settings_flash = BlockingPartition::new(flash, settings_part.offset, half);
+    let mut schedule_flash = BlockingPartition::new(flash, settings_part.offset + half, half);
+    let (store, settings) =
+        match thermostat_core::store::load_split(&mut settings_flash, &mut schedule_flash) {
+            Ok((store, Some(s))) => {
+                log::info!(
+                    "settings loaded: hostname '{}', wifi '{}', setpoint {}",
+                    s.hostname,
+                    s.wifi_ssid,
+                    thermostat_core::http::Tenths(s.setpoint_dc as i32)
+                );
+                (store, s)
+            }
+            Ok((store, None)) => {
+                log::info!("no stored settings; using defaults");
+                (store, Default::default())
+            }
+            Err(e) => panic!("settings partition: {e:?}"),
+        };
     let settings = board::fit(settings);
+    let (schedule_store, schedules) = match ScheduleStore::load(&mut schedule_flash) {
+        Ok(loaded) => loaded,
+        Err(e) => panic!("schedule store: {e:?}"),
+    };
+    log::info!("{} sensor schedule(s) loaded", schedules.len());
 
     static ALIGNED: StaticCell<embassy_boot::AlignedBuffer<4>> = StaticCell::new();
     let aligned = &mut ALIGNED.init(embassy_boot::AlignedBuffer([0; 4])).0;
@@ -125,6 +133,11 @@ async fn main(spawner: Spawner) -> ! {
         settings,
         store,
         settings_flash,
+        device::ScheduleState {
+            schedules,
+            store: schedule_store,
+            flash: schedule_flash,
+        },
         updater,
     )))));
     let boot = dev.with(|d| d.boot);

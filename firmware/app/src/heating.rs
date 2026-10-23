@@ -8,7 +8,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Output;
-use thermostat_core::control::{GroupState, cc_to_dc, readings};
+use thermostat_core::clock::TimeZone;
+use thermostat_core::control::{GroupState, apply_schedules, cc_to_dc, readings};
 use thermostat_core::http::Tenths;
 
 use crate::board;
@@ -42,7 +43,14 @@ pub async fn task(mut relays: [Output<'static>; board::ZONES], dev: Handle) {
         let (heat, request, changes, grouped) = dev.with(|d| {
             d.ble
                 .set_keep(d.settings.temp_sensors.iter().map(|t| t.addr));
-            let room = readings(&d.ble, &d.settings.temp_sensors, now);
+            let mut room = readings(&d.ble, &d.settings.temp_sensors, now);
+            // Scheduled setpoints, once the local time is known.
+            let local = d.clock.unix_s(Instant::now().as_micros()).map(|t| {
+                TimeZone::parse(&d.settings.timezone)
+                    .unwrap_or(TimeZone::UTC)
+                    .local(t)
+            });
+            apply_schedules(&mut room, &d.schedule.schedules, local.as_ref());
             d.readings = room.clone();
             let min_on_ms = d.settings.min_on_min as u64 * 60_000;
             let now_unix = d.clock.unix_s(Instant::now().as_micros());

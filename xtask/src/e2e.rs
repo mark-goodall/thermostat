@@ -736,8 +736,100 @@ pub fn run_dual(dir: &Path, release: bool, single_img: &Path, sntp_port: u16) ->
         Ok(())
     })?;
 
+    let auth = [("Authorization", basic.as_str())];
+    let up_hex = format!(
+        "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        up[5], up[4], up[3], up[2], up[1], up[0]
+    );
+    let up_sensor = |s: &Value| -> Value {
+        s["sensors"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["zone"] == 1).cloned())
+            .unwrap_or(Value::Null)
+    };
+
+    step(
+        "a schedule raises zone Up's setpoint for the current hour",
+        || {
+            // Up reads 23.0 against a fixed 21.0: off. Schedule 25.0 all week.
+            let mut form = String::from("on=1");
+            for h in 0..24 {
+                form.push_str(&format!("&d{h}=25.0&e{h}=25.0"));
+            }
+            let (code, body) = emu.request(
+                "POST",
+                &format!("/api/schedule?sensor={up_hex}"),
+                &auth,
+                form.as_bytes(),
+            )?;
+            anyhow::ensure!(
+                code == 200 && body.contains("\"enabled\":true"),
+                "{code} {body}"
+            );
+            let s = emu.wait_status("Up on by schedule", Duration::from_secs(15), |s| {
+                zone_heating(s, 1) == Some(true)
+            })?;
+            let sensor = up_sensor(&s);
+            anyhow::ensure!(
+                sensor["setpoint"] == 25.0 && sensor["scheduled"] == true,
+                "{s}"
+            );
+            Ok(())
+        },
+    )?;
+
+    step(
+        "turning the schedule off restores the fixed setpoint",
+        || {
+            let (code, body) = emu.request(
+                "POST",
+                &format!("/api/schedule?sensor={up_hex}"),
+                &auth,
+                b"d0=25.0",
+            )?;
+            anyhow::ensure!(
+                code == 200 && body.contains("\"enabled\":false"),
+                "{code} {body}"
+            );
+            // Down still heats, so Up leaves at once.
+            let s = emu.wait_status("Up off", Duration::from_secs(15), |s| {
+                zone_heating(s, 1) == Some(false)
+            })?;
+            let sensor = up_sensor(&s);
+            anyhow::ensure!(
+                sensor["setpoint"] == 21.0 && sensor["scheduled"] == false,
+                "{s}"
+            );
+            Ok(())
+        },
+    )?;
+
+    step(
+        "boost heats zone Up for an hour; cancelling stops it",
+        || {
+            let (code, body) = emu.request("POST", "/api/boost", &auth, b"zone=1")?;
+            anyhow::ensure!(code == 200, "{code} {body}");
+            let s = emu.wait_status("Up boosted", Duration::from_secs(15), |s| {
+                zone_heating(s, 1) == Some(true)
+            })?;
+            let left = s["zones"][1]["boost_remaining_s"].as_u64().unwrap_or(0);
+            anyhow::ensure!(
+                s["zones"][1]["reason"] == "boost" && (3500..=3600).contains(&left),
+                "{s}"
+            );
+            let (code, _) = emu.request("POST", "/api/boost", &auth, b"zone=1&on=0")?;
+            anyhow::ensure!(code == 200);
+            let s = emu.wait_status("boost cancelled", Duration::from_secs(15), |s| {
+                zone_heating(s, 1) == Some(false)
+            })?;
+            anyhow::ensure!(s["zones"][1]["boost_remaining_s"].is_null(), "{s}");
+            let (code, _) = emu.request("POST", "/api/boost", &auth, b"zone=2")?;
+            anyhow::ensure!(code == 400, "zone 3 does not exist");
+            Ok(())
+        },
+    )?;
+
     step("an image for the single-zone board is refused", || {
-        let auth = [("Authorization", basic.as_str())];
         let (code, body) = emu.request(
             "POST",
             "/api/update?reboot=0",

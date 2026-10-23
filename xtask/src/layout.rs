@@ -5,7 +5,7 @@
 //! | 0x1000   | 0x7000   | second-stage bootloader (embassy-boot-esp)    |
 //! | 0x8000   | 0x1000   | partition table                               |
 //! | 0x9000   | 0x2000   | embassy-boot swap state                       |
-//! | 0x10000  | 0x10000  | settings (wear-levelled record log)           |
+//! | 0x10000  | 0x10000  | settings records (32 KiB) + schedules (32 KiB) |
 //! | 0x20000  | 0x1C0000 | active application (executes in place)       |
 //! | 0x1E0000 | 0x1C1000 | DFU: staged update / previous image after swap |
 //! | 0x3A1000 | 0x5F000  | spare                                         |
