@@ -64,7 +64,7 @@ A change takes effect after a reboot.
 
 ## Heating control
 
-- **Sensors.** On the settings page, check up to 4 BLE temperature sensors and
+- **Sensors.** On the settings page, check up to 8 BLE temperature sensors and
   give each its own setpoint (5.0–35.0 °C) and, optionally, a name of up to 16
   characters (e.g. "Landing"). The name is shown on the thermostat's pages, in
   `/api/status` and in the log. The sensor's own advertised name (e.g.
@@ -211,17 +211,18 @@ fall back to plain setpoint control.
 The WiFi build also runs a passive BLE scan on the same radio (esp-radio
 `ble` + `coex`). It drives the controller with plain HCI through `bt-hci`, so
 no host stack is needed. `/ble` in the web UI (auto-refreshing) and
-`/api/ble` list nearby advertisers with:
+`/api/ble` list nearby temperature sensors with:
 
 - RSSI, name, and maker (Bluetooth SIG company ID)
 - 16-bit service UUIDs, with names for common ones
 - packet count and when each was last seen
 
-The table holds 24 devices; one not heard for 15 minutes is dropped. Phones,
-laptops and trackers advertise from *private* random addresses that change every
-few minutes. These are ignored unless the advertisement carries a sensor reading;
-`/api/ble` counts them in `ignored_private`. Public and random *static* addresses
-(used by some sensors) are listed.
+Only temperature sensors are kept: an advertisement that does not decode as a
+reading (and is not from a sensor already known) is dropped and counted in
+`ignored`. That keeps phones, laptops and beacons, many on rotating private
+addresses, out of memory. The table holds 8 sensors; when full, the least
+recently heard sensor that is not selected makes way (selected sensors are
+never evicted), and one not heard for 15 minutes is dropped.
 
 Readings from supported thermometers (table above) are decoded into
 temperature, humidity and battery. Stock Xiaomi

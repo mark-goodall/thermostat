@@ -62,7 +62,7 @@ pub fn str48(s: &str) -> Str48 {
     out
 }
 
-pub const MAX_TEMP_SENSORS: usize = 4;
+pub const MAX_TEMP_SENSORS: usize = 8;
 
 /// Longest sensor name, in bytes.
 pub const MAX_SENSOR_NAME: usize = 16;

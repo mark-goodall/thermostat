@@ -199,10 +199,10 @@ impl Platform for Handle {
         self.with(|d| d.settings.clone())
     }
 
-    fn save_settings(&mut self, settings: Settings) -> Result<(), StoreError> {
+    fn save_settings(&mut self, settings: &Settings) -> Result<(), StoreError> {
         self.with(|d| {
-            d.store.save(&mut d.settings_flash, &settings)?;
-            d.settings = settings;
+            d.store.save(&mut d.settings_flash, settings)?;
+            d.settings.clone_from(settings);
             Ok(())
         })
     }

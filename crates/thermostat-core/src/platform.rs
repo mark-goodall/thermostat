@@ -121,7 +121,7 @@ pub trait Platform: Ota {
     }
     /// A snapshot of the current settings.
     fn settings(&self) -> Settings;
-    fn save_settings(&mut self, settings: Settings) -> Result<(), StoreError>;
+    fn save_settings(&mut self, settings: &Settings) -> Result<(), StoreError>;
     fn random(&mut self, buf: &mut [u8]);
     fn now_ms(&self) -> u64;
     fn status(&mut self) -> DeviceStatus;

@@ -34,7 +34,9 @@ use crate::settings::{Settings, Str32};
 
 /// Scratch space a connection needs (request head + response page).
 pub const BUF_LEN: usize = http::MAX_HEAD + PAGE_LEN;
-const PAGE_LEN: usize = 8 * 1024;
+// The worst case (dual board, eight sensors, 16-byte names made entirely of
+// HTML-escaped characters) renders the settings page in about 9.5 KiB.
+const PAGE_LEN: usize = 10 * 1024;
 const MAX_FORM: usize = 1024;
 
 enum Auth {
@@ -62,14 +64,16 @@ pub async fn handle<S: Read + Write, P: Platform>(
             .await;
         }
     };
-    let auth = authenticate(&req, p);
+    // One copy of the settings per request, shared by everything below (each
+    // copy is several hundred bytes of stack and of this task's state).
+    let mut s = p.settings();
+    let auth = authenticate(&req, p, &s);
     let authed = !matches!(auth, Auth::None);
     log::debug!("{:?} {}", req.method, req.path);
 
     match (req.method, req.path) {
         (Method::Get, "/api/status") => {
             let st = p.status();
-            let s = p.settings();
             respond(sock, page_buf, 200, "application/json", &[], |w| {
                     write!(
                         w,
@@ -156,7 +160,7 @@ pub async fn handle<S: Read + Write, P: Platform>(
         }
         (Method::Get, "/api/zone") => {
             let now = p.now_ms();
-            let own = own_zone_message(p);
+            let own = own_zone_message(p, &s);
             let snapshot = zone_snapshot(p, now);
             respond(sock, page_buf, 200, "application/json", &[], |w| {
                 zone_json(w, own.as_ref(), &snapshot)
@@ -166,7 +170,6 @@ pub async fn handle<S: Read + Write, P: Platform>(
         (Method::Post, "/api/zone/event") => {
             let mut form = [0u8; MAX_FORM];
             let body = read_form(sock, &req, body_prefix, &mut form).await?;
-            let s = p.settings();
             let now_unix = p.status().unix_time;
             match crate::zones::ZoneMessage::decode(
                 body,
@@ -179,7 +182,7 @@ pub async fn handle<S: Read + Write, P: Platform>(
                     let now = p.now_ms();
                     p.zones(|g| g.receive(&msg, now));
                     // Reply with our own state so the sender learns it right away.
-                    let reply = own_zone_message(p)
+                    let reply = own_zone_message(p, &s)
                         .map(|m| m.encode(&s.group_key))
                         .unwrap_or_default();
                     respond(sock, page_buf, 200, "text/plain", &[], |w| {
@@ -199,7 +202,7 @@ pub async fn handle<S: Read + Write, P: Platform>(
                 }
             }
         }
-        (_, "/setup") if p.settings().is_provisioned() => redirect(sock, page_buf, "/", None).await,
+        (_, "/setup") if s.is_provisioned() => redirect(sock, page_buf, "/", None).await,
         (Method::Get, "/setup") => {
             page(sock, page_buf, "Setup", false, |w| setup_form(w, None)).await
         }
@@ -212,16 +215,15 @@ pub async fn handle<S: Read + Write, P: Platform>(
             if let Err(msg) = check_new_password(&pass, &pass2).and(check_username(&user)) {
                 return page(sock, page_buf, "Setup", false, |w| setup_form(w, Some(msg))).await;
             }
-            let mut s = p.settings();
             s.admin_user = user;
             s.admin_hash = Some(new_hash(p, &pass));
-            if p.save_settings(s).is_err() {
+            if p.save_settings(&s).is_err() {
                 return error(sock, page_buf, 500, "could not save settings").await;
             }
             let token = new_session(p);
             redirect(sock, page_buf, "/settings", Some(&token)).await
         }
-        (_, path) if !p.settings().is_provisioned() && !path.starts_with("/api/") => {
+        (_, path) if !s.is_provisioned() && !path.starts_with("/api/") => {
             redirect(sock, page_buf, "/setup", None).await
         }
         (Method::Get, "/login") => {
@@ -232,7 +234,7 @@ pub async fn handle<S: Read + Write, P: Platform>(
             let form = read_form(sock, &req, body_prefix, &mut form).await?;
             let user: Str32 = http::form_field(form, "user").unwrap_or_default();
             let pass: String<64> = http::form_field(form, "password").unwrap_or_default();
-            if check_credentials(&p.settings(), &user, &pass) {
+            if check_credentials(&s, &user, &pass) {
                 let token = new_session(p);
                 redirect(sock, page_buf, "/", Some(&token)).await
             } else {
@@ -268,7 +270,6 @@ pub async fn handle<S: Read + Write, P: Platform>(
         }
         (Method::Get, "/") => {
             let st = p.status();
-            let s = p.settings();
             let version: Str32 = crate::settings::str32(p.running_version());
             let now = p.now_ms();
             let zone = (!s.heater_id.is_empty()).then(|| zone_snapshot(p, now));
@@ -278,7 +279,6 @@ pub async fn handle<S: Read + Write, P: Platform>(
             .await
         }
         (Method::Get, "/settings") => {
-            let s = p.settings();
             let now = p.now_ms();
             let found = sensor_candidates(p);
             let zones = p.zone_count();
@@ -290,15 +290,16 @@ pub async fn handle<S: Read + Write, P: Platform>(
         (Method::Post, "/settings") => {
             let mut form = [0u8; MAX_FORM];
             let form = read_form(sock, &req, body_prefix, &mut form).await?;
-            let (msg, s) = match apply_settings(p, form) {
-                Ok(s) => match p.save_settings(s.clone()) {
-                    Ok(()) => (
-                        Notice::Ok("Saved. Network changes apply after a reboot."),
-                        s,
-                    ),
-                    Err(_) => (Notice::Err("Could not write settings to flash."), s),
+            let msg = match apply_settings(p, &mut s, form) {
+                Ok(()) => match p.save_settings(&s) {
+                    Ok(()) => Notice::Ok("Saved. Network changes apply after a reboot."),
+                    Err(_) => Notice::Err("Could not write settings to flash."),
                 },
-                Err(msg) => (Notice::Err(msg), p.settings()),
+                Err(msg) => {
+                    // Show what is stored, not the half-applied form.
+                    s = p.settings();
+                    Notice::Err(msg)
+                }
             };
             let now = p.now_ms();
             let found = sensor_candidates(p);
@@ -310,18 +311,8 @@ pub async fn handle<S: Read + Write, P: Platform>(
         }
         (Method::Get, "/ble") => {
             let now = p.now_ms();
-            let snapshot = p.ble(|t| {
-                t.map(|t| {
-                    (
-                        t.sorted(),
-                        t.reports,
-                        t.scanning,
-                        t.error,
-                        t.ignored_private,
-                    )
-                })
-            });
-            let s = p.settings();
+            let snapshot =
+                p.ble(|t| t.map(|t| (t.sorted(), t.reports, t.scanning, t.error, t.ignored)));
             page(sock, page_buf, "Bluetooth", true, |w| {
                 ble_page(w, &s, snapshot.as_ref(), now)
             })
@@ -329,17 +320,8 @@ pub async fn handle<S: Read + Write, P: Platform>(
         }
         (Method::Get, "/api/ble") => {
             let now = p.now_ms();
-            let snapshot = p.ble(|t| {
-                t.map(|t| {
-                    (
-                        t.sorted(),
-                        t.reports,
-                        t.scanning,
-                        t.error,
-                        t.ignored_private,
-                    )
-                })
-            });
+            let snapshot =
+                p.ble(|t| t.map(|t| (t.sorted(), t.reports, t.scanning, t.error, t.ignored)));
             respond(sock, page_buf, 200, "application/json", &[], |w| {
                 ble_json(w, snapshot.as_ref(), now)
             })
@@ -418,7 +400,7 @@ pub async fn handle<S: Read + Write, P: Platform>(
     }
 }
 
-fn authenticate<P: Platform>(req: &Request<'_>, p: &mut P) -> Auth {
+fn authenticate<P: Platform>(req: &Request<'_>, p: &mut P, s: &Settings) -> Auth {
     let now = p.now_ms();
     if let Some(t) = req.cookie("session") {
         let mut token = [0u8; TOKEN_LEN];
@@ -432,7 +414,7 @@ fn authenticate<P: Platform>(req: &Request<'_>, p: &mut P) -> Auth {
             && let Some((user, pass)) = core::str::from_utf8(&raw[..n])
                 .ok()
                 .and_then(|s| s.split_once(':'))
-            && check_credentials(&p.settings(), user, pass)
+            && check_credentials(s, user, pass)
         {
             return Auth::Basic;
         }
@@ -483,9 +465,13 @@ fn check_username(user: &str) -> Result<(), &'static str> {
     }
 }
 
-/// Validate a settings form against the current settings.
-fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'static str> {
-    let mut s = p.settings();
+/// Apply a settings form to `s` (the current settings). On error `s` may be
+/// partly changed; the caller discards it.
+fn apply_settings<P: Platform>(
+    p: &mut P,
+    s: &mut Settings,
+    form: &str,
+) -> Result<(), &'static str> {
     let field = |k| http::form_field::<64>(form, k).ok_or("Invalid form data.");
     let hostname = field("hostname")?;
     if hostname.is_empty()
@@ -628,7 +614,7 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
             })
             .is_err()
         {
-            return Err("Select at most 4 temperature sensors.");
+            return Err(SENSOR_LIMIT);
         }
     }
 
@@ -637,7 +623,7 @@ fn apply_settings<P: Platform>(p: &mut P, form: &str) -> Result<Settings, &'stat
         check_new_password(&new_pass, &field("new_password2")?)?;
         s.admin_hash = Some(new_hash(p, &new_pass));
     }
-    Ok(s)
+    Ok(())
 }
 
 async fn read_form<'b, S: Read>(
@@ -813,7 +799,8 @@ nav{display:flex;gap:1em;align-items:center}nav a{color:#fff}nav form{margin:0}\
 main{max-width:34em;margin:1em auto;background:#fff;padding:1em 1.5em;border-radius:6px}\
 label{display:block;margin:.6em 0 .2em}input{width:100%;padding:.4em;box-sizing:border-box}\
 button{margin-top:1em;padding:.4em 1em}fieldset{margin:1em 0;border:1px solid #ccc}\
-.ok{background:#dfd;padding:.5em}.err{background:#fdd;padding:.5em}td{padding:.2em .8em .2em 0}";
+.ok{background:#dfd;padding:.5em}.err{background:#fdd;padding:.5em}td{padding:.2em .8em .2em 0}\
+input[type=checkbox]{width:auto}.s{margin-left:2em}";
 
 enum Notice {
     Ok(&'static str),
@@ -1010,43 +997,18 @@ fn status_tail(
     )
 }
 
-/// Nearby devices that report a temperature: candidates for the thermostat.
-/// Sensors offered on the settings page. Kept small: the list is built on the
-/// main stack, which has little room beside the radio (see `firmware::stack`).
-const MAX_CANDIDATES: usize = 12;
-type Candidates = heapless::Vec<crate::ble::BleDevice, MAX_CANDIDATES>;
+/// Nearby temperature sensors (the BLE table keeps nothing else), strongest first.
+type Candidates = heapless::Vec<crate::ble::BleDevice, { crate::ble::MAX_DEVICES }>;
 
-/// Nearby devices reporting a temperature, strongest first; selected sensors
-/// are always included.
 fn sensor_candidates<P: Platform>(p: &mut P) -> Candidates {
-    let selected = p.settings().temp_sensors;
-    p.ble(|t| {
-        let mut v = Candidates::new();
-        let Some(t) = t else { return v };
-        let is_sensor =
-            |d: &&crate::ble::BleDevice| d.sensor.is_some_and(|r| r.temperature_cc.is_some());
-        let chosen = |d: &crate::ble::BleDevice| selected.iter().any(|s| s.addr == d.addr);
-        for d in t.iter().filter(is_sensor).filter(|d| chosen(d)) {
-            let _ = v.push(d.clone());
-        }
-        // Then the strongest of the rest, as long as there is room.
-        while !v.is_full() {
-            let next = t
-                .iter()
-                .filter(is_sensor)
-                .filter(|d| !v.iter().any(|c| c.addr == d.addr))
-                .max_by(|a, b| a.rssi.cmp(&b.rssi).then(b.addr.cmp(&a.addr)));
-            match next {
-                Some(d) => {
-                    let _ = v.push(d.clone());
-                }
-                None => break,
-            }
-        }
-        v.sort_unstable_by(|a, b| b.rssi.cmp(&a.rssi).then(a.addr.cmp(&b.addr)));
-        v
-    })
+    p.ble(|t| t.map(|t| t.sorted()).unwrap_or_default())
 }
+
+const SENSOR_LIMIT: &str = "Select at most 8 temperature sensors.";
+const _: () = assert!(
+    crate::settings::MAX_TEMP_SENSORS == 8,
+    "update SENSOR_LIMIT"
+);
 
 /// Form field for one sensor: `prefix` (`sp_` setpoint, `nm_` name) and the address in hex.
 fn sensor_field(prefix: &str, addr: &[u8; 6]) -> String<16> {
@@ -1082,7 +1044,7 @@ fn sensor_inputs(
 ) -> core::fmt::Result {
     write!(
         w,
-        "<div style=margin-left:2em><label>Name<input name={} value=\"{}\" maxlength={} placeholder=\"e.g. Landing\"></label>\
+        "<div class=s><label>Name<input name={} value=\"{}\" maxlength={}></label>\
 <label>Setpoint (°C)<input name={} value={} inputmode=decimal size=5></label>",
         sensor_field("nm_", addr),
         Escape(t.map_or("", |t| t.name.as_str())),
@@ -1138,7 +1100,7 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
         let checked = if selected.is_some() { " checked" } else { "" };
         write!(
             w,
-            "<label><input type=checkbox name=sensor value={}{checked} style=width:auto> ",
+            "<label><input type=checkbox name=sensor value={}{checked}> ",
             d.addr_string(),
         )?;
         sensor_label(w, s, &d.addr)?;
@@ -1164,7 +1126,7 @@ off once all are at their setpoint plus half the hysteresis (after the minimum o
             let addr = crate::ble::format_addr(&t.addr);
             write!(
                 w,
-                "<label><input type=checkbox name=sensor value={addr} checked style=width:auto> "
+                "<label><input type=checkbox name=sensor value={addr} checked> "
             )?;
             sensor_label(w, s, &t.addr)?;
             w.write_str(" · not heard recently</label>")?;
@@ -1261,22 +1223,21 @@ Leave empty if this thermostat has its own heater.</small></p>\
         if s.group_key.is_empty() {
             ""
         } else {
-            "<label><input type=checkbox name=clear_group_key style=width:auto> Remove the group key</label>"
+            "<label><input type=checkbox name=clear_group_key> Remove the group key</label>"
         },
     )
 }
 
 /// This zone's state as a group message (None when not in a heater group).
-fn own_zone_message<P: Platform>(p: &mut P) -> Option<crate::zones::ZoneMessage> {
-    let s = p.settings();
+fn own_zone_message<P: Platform>(p: &mut P, s: &Settings) -> Option<crate::zones::ZoneMessage> {
     if s.heater_id.is_empty() {
         return None;
     }
     let st = p.status();
     let heater_on_since = p.zones(|g| g.heater_on_since);
     Some(crate::zones::ZoneMessage {
-        heater: s.heater_id,
-        zone: s.hostname,
+        heater: s.heater_id.clone(),
+        zone: s.hostname.clone(),
         heat: st.heat_request,
         heater_on_since,
         ts: st.unix_time,
@@ -1403,8 +1364,8 @@ fn ble_page(
     };
     write!(
         w,
-        "<p>{} · {} devices · {} advertisements received, {} of them from rotating private addresses \
-(phones, laptops) and not listed. Refreshes every 5 s.</p>",
+        "<p>{} · {} temperature sensors · {} advertisements received, {} of them from other devices \
+(phones, laptops, beacons) and not kept. Refreshes every 5 s.</p>",
         if *scanning {
             "Passive scan running"
         } else {
@@ -1468,7 +1429,7 @@ fn ble_json(w: &mut BufWriter<'_>, snap: Option<&BleSnapshot>, now: u64) -> core
     };
     write!(
         w,
-        "{{\"supported\":true,\"scanning\":{scanning},\"reports\":{reports},\"ignored_private\":{ignored},\"devices\":["
+        "{{\"supported\":true,\"scanning\":{scanning},\"reports\":{reports},\"ignored\":{ignored},\"devices\":["
     )?;
     for (i, d) in devices.iter().enumerate() {
         write!(
@@ -1611,8 +1572,8 @@ mod tests {
         fn settings(&self) -> Settings {
             self.settings.clone()
         }
-        fn save_settings(&mut self, s: Settings) -> Result<(), StoreError> {
-            self.settings = s;
+        fn save_settings(&mut self, s: &Settings) -> Result<(), StoreError> {
+            self.settings = s.clone();
             self.saves += 1;
             Ok(())
         }
@@ -2039,35 +2000,34 @@ mod tests {
 
         let mut t = crate::ble::BleTable::new();
         t.scanning = true;
-        // A pvvx thermometer advertising its reading, and a phone with an HTML-ish name.
+        // Two pvvx thermometers (one with an HTML-ish name) and a phone.
         let mut thermo = std::vec![2, 0x01, 0x06, 18, 0x16, 0x1A, 0x18, 1, 2, 3, 4, 5, 6];
         thermo.extend_from_slice(&2137i16.to_le_bytes());
         thermo.extend_from_slice(&4567u16.to_le_bytes());
         thermo.extend_from_slice(&[0x86, 0x0B, 87, 1, 0]);
         t.observe([6, 5, 4, 3, 2, 1], 0, -55, &thermo, 500);
-        let mut phone = std::vec![4, 0xFF, 0x4C, 0x00, 0x10];
-        phone.extend_from_slice(&[5, 0x09]);
-        phone.extend_from_slice(b"<b\"x");
-        t.observe([9, 9, 9, 9, 9, 0xC9], 1, -80, &phone, 900); // random static
-        t.observe([7, 7, 7, 7, 7, 0x47], 1, -40, &phone, 950); // rotating private: dropped
+        let mut named = thermo.clone();
+        named.extend_from_slice(&[5, 0x09]);
+        named.extend_from_slice(b"<b\"x");
+        t.observe([9, 9, 9, 9, 9, 0xC9], 1, -80, &named, 900);
+        let phone = [4, 0xFF, 0x4C, 0x00, 0x10];
+        t.observe([7, 7, 7, 7, 7, 0x47], 1, -40, &phone, 950); // not a sensor: dropped
         p.ble = Some(t);
 
         let html = get(&mut p, "/ble", &cookie).text();
-        assert!(html.contains("2 devices"), "{html}");
-        assert!(html.contains("3 advertisements received, 1 of them from rotating private"));
+        assert!(html.contains("2 temperature sensors"), "{html}");
+        assert!(html.contains("3 advertisements received, 1 of them from other devices"));
         assert!(!html.contains("47:07:07"));
         assert!(html.contains("01:02:03:04:05:06"));
         assert!(html.contains("21.3 °C") && html.contains("45.6 %") && html.contains("87%"));
-        assert!(html.contains("Apple") && html.contains("&lt;b&quot;x") && !html.contains("<b\"x"));
+        assert!(html.contains("&lt;b&quot;x") && !html.contains("<b\"x"));
         assert!(html.ends_with("</html>"));
         // Strongest signal first.
         assert!(html.find("01:02:03:04:05:06").unwrap() < html.find("C9:09:09:09:09:09").unwrap());
 
         let json = get(&mut p, "/api/ble", &cookie).text();
         assert!(
-            json.starts_with(
-                "{\"supported\":true,\"scanning\":true,\"reports\":3,\"ignored_private\":1,"
-            ),
+            json.starts_with("{\"supported\":true,\"scanning\":true,\"reports\":3,\"ignored\":1,"),
             "{json}"
         );
         assert!(json.contains("\"temperature\":21.3") && json.contains("\"battery\":87"));
@@ -2104,24 +2064,25 @@ mod tests {
             tp,
             0,
             -60,
-            &[
-                13, 0x09, b'T', b'P', b'3', b'5', b'7', b' ', b'(', b'2', b'1', b'4', b'2', b')',
-            ],
-            0,
+            &[7, 0xFF, 0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C],
+            1000,
         );
+        // A later packet with only the name is merged into the known sensor.
         t.observe(
             tp,
             0,
             -60,
-            &[7, 0xFF, 0xC2, 0xF1, 0x00, 0x1D, 0x02, 0x2C],
+            &[
+                13, 0x09, b'T', b'P', b'3', b'5', b'7', b' ', b'(', b'2', b'1', b'4', b'2', b')',
+            ],
             1000,
         );
-        t.observe([1; 6], 1, -40, &[4, 0xFF, 0x4C, 0x00, 0x10], 1000); // no reading: not a candidate
+        t.observe([1; 6], 1, -40, &[4, 0xFF, 0x4C, 0x00, 0x10], 1000); // no reading: not kept
         p.ble = Some(t);
 
         let html = get(&mut p, "/settings", &cookie).text();
         assert!(
-            html.contains("name=sensor value=AA:BB:CC:DD:EE:FF style"),
+            html.contains("name=sensor value=AA:BB:CC:DD:EE:FF>"),
             "{html}"
         );
         assert!(html.contains("TP357 (2142)") && html.contains("24.1 °C"));
@@ -2223,16 +2184,16 @@ mod tests {
                 .contains("not heard recently")
         );
 
-        let five: std::string::String = (1..=5)
-            .map(|i| std::format!("&sensor=0{i}%3A00%3A00%3A00%3A00%3A00"))
+        let too_many: std::string::String = (1..=crate::settings::MAX_TEMP_SENSORS + 1)
+            .map(|i| std::format!("&sensor={i:02X}%3A00%3A00%3A00%3A00%3A00"))
             .collect();
         let r = post(
             &mut p,
             "/settings",
             &cookie,
-            std::format!("{base}{five}").as_bytes(),
+            std::format!("{base}{too_many}").as_bytes(),
         );
-        assert!(r.text().contains("at most 4"));
+        assert!(r.text().contains("at most 8"));
         assert!(
             post(
                 &mut p,

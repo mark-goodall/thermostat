@@ -40,6 +40,8 @@ pub async fn task(mut relays: [Output<'static>; board::ZONES], dev: Handle) {
     loop {
         let now = Instant::now().as_millis();
         let (heat, request, changes, grouped) = dev.with(|d| {
+            d.ble
+                .set_keep(d.settings.temp_sensors.iter().map(|t| t.addr));
             let room = readings(&d.ble, &d.settings.temp_sensors, now);
             d.readings = room.clone();
             let min_on_ms = d.settings.min_on_min as u64 * 60_000;

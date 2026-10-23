@@ -7,8 +7,9 @@
 
 use heapless::{String, Vec};
 
-/// Devices remembered at once. When full, the least recently seen is replaced.
-pub const MAX_DEVICES: usize = 24;
+/// Sensors remembered at once (only temperature sensors are kept). When full,
+/// the least recently heard sensor that is not selected makes way.
+pub const MAX_DEVICES: usize = crate::settings::MAX_TEMP_SENSORS;
 /// Devices not heard from for this long are dropped. Longer than
 /// `control::READING_MAX_AGE_MS`, so that rule decides when a selected
 /// sensor's reading stops counting.
@@ -325,9 +326,10 @@ pub struct BleTable {
     devices: Vec<BleDevice, MAX_DEVICES>,
     /// Advertising reports processed since start.
     pub reports: u32,
-    /// Reports dropped because they came from a rotating private address and
-    /// carried no sensor reading (they would only fill the table).
-    pub ignored_private: u32,
+    /// Reports dropped because they did not come from a temperature sensor.
+    pub ignored: u32,
+    /// Sensors never evicted to make room (the selected ones).
+    keep: Vec<[u8; 6], MAX_DEVICES>,
     pub scanning: bool,
     pub error: Option<&'static str>,
 }
@@ -337,9 +339,19 @@ impl BleTable {
         Self {
             devices: Vec::new(),
             reports: 0,
-            ignored_private: 0,
+            ignored: 0,
+            keep: Vec::new(),
             scanning: false,
             error: None,
+        }
+    }
+
+    /// Addresses that must stay in the table while there is room for them
+    /// (the selected sensors).
+    pub fn set_keep(&mut self, addrs: impl Iterator<Item = [u8; 6]>) {
+        self.keep.clear();
+        for a in addrs {
+            let _ = self.keep.push(a);
         }
     }
 
@@ -348,19 +360,21 @@ impl BleTable {
         self.reports = self.reports.wrapping_add(1);
         let info = parse_adv(data);
         let addr_kind = AddrKind::from_raw(addr_kind, &addr);
-        // Rotating private addresses would fill the table with a new entry every
-        // few minutes per phone. Keep only those that broadcast a sensor reading.
-        if addr_kind == AddrKind::RandomPrivate
+        let known = self.devices.iter().position(|d| d.addr == addr);
+        // Only temperature sensors are kept: a new device must broadcast a
+        // reading. Phones, laptops and beacons (many on rotating addresses)
+        // would only fill the table.
+        if known.is_none()
             && info.sensor.is_none()
             && !info
                 .manufacturer
                 .as_ref()
                 .is_some_and(|m| decode_thermopro(info.name.as_deref(), m).is_some())
         {
-            self.ignored_private = self.ignored_private.wrapping_add(1);
+            self.ignored = self.ignored.wrapping_add(1);
             return;
         }
-        let dev = match self.devices.iter().position(|d| d.addr == addr) {
+        let dev = match known {
             Some(i) => &mut self.devices[i],
             None => {
                 let fresh = BleDevice {
@@ -379,9 +393,13 @@ impl BleTable {
                     packets: 0,
                 };
                 if self.devices.is_full() {
-                    let oldest = (0..self.devices.len())
+                    let keep = &self.keep;
+                    let Some(oldest) = (0..self.devices.len())
+                        .filter(|&i| !keep.contains(&self.devices[i].addr))
                         .min_by_key(|&i| self.devices[i].last_seen_ms)
-                        .unwrap();
+                    else {
+                        return; // every entry is a selected sensor
+                    };
                     self.devices[oldest] = fresh;
                     &mut self.devices[oldest]
                 } else {
@@ -634,54 +652,63 @@ mod tests {
         assert_eq!(d.name, None);
     }
 
-    #[test]
-    fn rotating_private_addresses_are_dropped() {
-        let mut t = BleTable::new();
-        let apple = ad(0xFF, &[0x4C, 0x00, 0x10, 0x05]);
-        // Resolvable (top bits 01) and non-resolvable (00) private: dropped.
-        t.observe([1, 2, 3, 4, 5, 0x4D], 1, -60, &apple, 0);
-        t.observe([1, 2, 3, 4, 5, 0x1C], 1, -60, &apple, 0);
-        assert_eq!((t.len(), t.ignored_private, t.reports), (0, 2, 2));
-        // Random static (11) and public addresses are kept.
-        t.observe([1, 2, 3, 4, 5, 0xE2], 1, -60, &apple, 0);
-        t.observe([1, 2, 3, 4, 5, 0x1C], 0, -60, &apple, 0);
-        assert_eq!(t.len(), 2);
-        // A private address broadcasting a sensor reading is kept.
-        let mut pvvx = std::vec![18, 0x16, 0x1A, 0x18, 1, 2, 3, 4, 5, 6];
-        pvvx.extend_from_slice(&2000i16.to_le_bytes());
-        pvvx.extend_from_slice(&[0x88, 0x13, 0x86, 0x0B, 90, 1, 0]);
-        t.observe([9, 9, 9, 9, 9, 0x40], 1, -60, &pvvx, 0);
-        let d = t.get(&[9, 9, 9, 9, 9, 0x40]).unwrap();
-        assert_eq!(d.addr_kind, AddrKind::RandomPrivate);
-        assert!(d.sensor.is_some());
-        assert_eq!(t.ignored_private, 2);
+    /// A pvvx frame carrying `temp_cc`.
+    fn pvvx(temp_cc: i16) -> std::vec::Vec<u8> {
+        let mut v = std::vec![18, 0x16, 0x1A, 0x18, 1, 2, 3, 4, 5, 6];
+        v.extend_from_slice(&temp_cc.to_le_bytes());
+        v.extend_from_slice(&[0x88, 0x13, 0x86, 0x0B, 90, 1, 0]);
+        v
     }
 
     #[test]
-    fn table_merges_evicts_and_expires() {
+    fn only_temperature_sensors_are_kept() {
         let mut t = BleTable::new();
-        let a = [1, 0, 0, 0, 0, 0xAA];
-        t.observe(a, 0, -70, &ad(0xFF, &[0x06, 0x00]), 0);
-        t.observe(a, 0, -60, &ad(0x09, b"Laptop"), 10); // scan response adds the name
-        let d = &t.sorted()[0];
+        let apple = ad(0xFF, &[0x4C, 0x00, 0x10, 0x05]);
+        // Phones, laptops, beacons: dropped whatever their address kind.
+        t.observe([1, 2, 3, 4, 5, 0x4D], 1, -60, &apple, 0);
+        t.observe([1, 2, 3, 4, 5, 0xE2], 1, -60, &apple, 0);
+        t.observe([1, 2, 3, 4, 5, 0x1C], 0, -60, &ad(0x09, b"Laptop"), 0);
+        assert_eq!((t.len(), t.ignored, t.reports), (0, 3, 3));
+        // Sensors are kept, including one on a rotating private address.
+        t.observe([9, 9, 9, 9, 9, 0x40], 1, -60, &pvvx(2000), 0);
+        let d = t.get(&[9, 9, 9, 9, 9, 0x40]).unwrap();
+        assert_eq!(d.addr_kind, AddrKind::RandomPrivate);
+        assert!(d.sensor.is_some());
+        // Once known, its other packets (e.g. a name alone) are merged in.
+        t.observe([9, 9, 9, 9, 9, 0x40], 1, -55, &ad(0x09, b"Hall"), 10);
+        let d = t.get(&[9, 9, 9, 9, 9, 0x40]).unwrap();
         assert_eq!(
-            (d.rssi, d.packets, d.company, d.name.as_deref()),
-            (-60, 2, Some(6), Some("Laptop"))
+            (d.name.as_deref(), d.rssi, d.packets),
+            (Some("Hall"), -55, 2)
         );
-        assert_eq!(d.addr_string().as_str(), "AA:00:00:00:00:01");
+        assert_eq!(t.ignored, 3);
+    }
 
+    #[test]
+    fn full_table_evicts_unselected_sensors_only() {
+        let mut t = BleTable::new();
+        let addr = |i: u8| [i, 0, 0, 0, 0, 0xC0];
         for i in 0..MAX_DEVICES as u8 {
-            t.observe([2, 0, 0, 0, 0, 0xC0 | i], 1, -90, &[], 100 + i as u64);
+            t.observe(addr(i), 0, -70, &pvvx(2000), 100 + i as u64);
         }
         assert_eq!(t.len(), MAX_DEVICES);
-        assert!(
-            t.sorted().iter().all(|d| d.addr != a),
-            "least recently seen evicted"
+        // Sensor 0 (least recently heard) is selected: sensor 1 makes way instead.
+        t.set_keep([addr(0)].into_iter());
+        t.observe(addr(100), 0, -70, &pvvx(2000), 1_000);
+        assert!(t.get(&addr(0)).is_some() && t.get(&addr(1)).is_none());
+        assert!(t.get(&addr(100)).is_some());
+        // With every entry selected, newcomers are not added.
+        t.set_keep(
+            t.iter()
+                .map(|d| d.addr)
+                .collect::<std::vec::Vec<_>>()
+                .into_iter(),
         );
-        assert_eq!(t.sorted()[0].addr_kind, AddrKind::RandomStatic);
-
-        t.expire(100 + EXPIRY_MS + 5);
-        assert_eq!(t.len(), MAX_DEVICES - 6);
-        assert_eq!(t.reports, 2 + MAX_DEVICES as u32);
+        t.observe(addr(101), 0, -70, &pvvx(2000), 2_000);
+        assert!(t.get(&addr(101)).is_none());
+        assert_eq!(t.len(), MAX_DEVICES);
+        // Expiry still applies.
+        t.expire(1_000 + EXPIRY_MS);
+        assert_eq!(t.len(), 0);
     }
 }
