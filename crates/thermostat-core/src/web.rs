@@ -131,6 +131,11 @@ pub async fn handle<S: Read + Write, P: Platform>(
                         "],\"sensors_used\":{},\"heating\":{},\"heating_reason\":\"{}\",\"min_on_min\":{}",
                         st.readings.len(), st.heating, st.heating_reason, s.min_on_min
                     )?;
+                    write!(
+                        w,
+                        ",\"stack_used\":{},\"stack_size\":{}",
+                        st.stack_used, st.stack_size
+                    )?;
                     match st.hold_remaining_s {
                         Some(r) => write!(w, ",\"hold_remaining_s\":{r}")?,
                         None => w.write_str(",\"hold_remaining_s\":null")?,
@@ -1006,18 +1011,39 @@ fn status_tail(
 }
 
 /// Nearby devices that report a temperature: candidates for the thermostat.
-type Candidates = heapless::Vec<crate::ble::BleDevice, { crate::ble::MAX_DEVICES }>;
+/// Sensors offered on the settings page. Kept small: the list is built on the
+/// main stack, which has little room beside the radio (see `firmware::stack`).
+const MAX_CANDIDATES: usize = 12;
+type Candidates = heapless::Vec<crate::ble::BleDevice, MAX_CANDIDATES>;
 
+/// Nearby devices reporting a temperature, strongest first; selected sensors
+/// are always included.
 fn sensor_candidates<P: Platform>(p: &mut P) -> Candidates {
+    let selected = p.settings().temp_sensors;
     p.ble(|t| {
         let mut v = Candidates::new();
-        if let Some(t) = t {
-            for d in t.sorted() {
-                if d.sensor.is_some_and(|r| r.temperature_cc.is_some()) {
-                    let _ = v.push(d);
+        let Some(t) = t else { return v };
+        let is_sensor =
+            |d: &&crate::ble::BleDevice| d.sensor.is_some_and(|r| r.temperature_cc.is_some());
+        let chosen = |d: &crate::ble::BleDevice| selected.iter().any(|s| s.addr == d.addr);
+        for d in t.iter().filter(is_sensor).filter(|d| chosen(d)) {
+            let _ = v.push(d.clone());
+        }
+        // Then the strongest of the rest, as long as there is room.
+        while !v.is_full() {
+            let next = t
+                .iter()
+                .filter(is_sensor)
+                .filter(|d| !v.iter().any(|c| c.addr == d.addr))
+                .max_by(|a, b| a.rssi.cmp(&b.rssi).then(b.addr.cmp(&a.addr)));
+            match next {
+                Some(d) => {
+                    let _ = v.push(d.clone());
                 }
+                None => break,
             }
         }
+        v.sort_unstable_by(|a, b| b.rssi.cmp(&a.rssi).then(a.addr.cmp(&b.addr)));
         v
     })
 }
@@ -1606,6 +1632,8 @@ mod tests {
                 network: String::try_from("qemu 10.0.2.15").unwrap(),
                 readings: self.readings.clone(),
                 zones: self.zone_status.iter().copied().collect(),
+                stack_used: 0,
+                stack_size: 0,
                 heating: false,
                 heat_request: false,
                 heating_reason: "no sensor reading",

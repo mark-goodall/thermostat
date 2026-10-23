@@ -245,6 +245,8 @@ impl Platform for Handle {
                 heating_reason: lead.reason,
                 hold_remaining_s: zones.iter().filter_map(|z| z.hold_remaining_s).max(),
                 zones: zones.clone(),
+                stack_used: crate::stack::peak_used() as u32,
+                stack_size: crate::stack::size() as u32,
                 unix_time: d.clock.unix_s(Instant::now().as_micros()),
                 time_synced_ago_s: d.clock.since_sync_s(Instant::now().as_micros()),
             }

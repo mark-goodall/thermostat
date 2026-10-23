@@ -18,6 +18,7 @@ mod mdns;
 mod net;
 mod serial;
 mod sntp;
+mod stack;
 mod web;
 mod zones;
 
@@ -52,6 +53,7 @@ const WATCHDOG_TIMEOUT: esp_hal::time::Duration = esp_hal::time::Duration::from_
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
+    stack::paint();
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
     // Raising the CPU clock also changes the APB clock the ROM programmed the
     // console UART's baud divider for; reconfigure UART0 before logging.
@@ -178,8 +180,13 @@ async fn supervise(
 ) -> ! {
     let mut up_since: Option<embassy_time::Instant> = None;
     let mut confirmed = boot == BootState::Booted;
+    let mut ticks = 0u32;
     loop {
         wdt.feed();
+        if ticks % 40 == 0 {
+            stack::report();
+        }
+        ticks = ticks.wrapping_add(1);
         if !confirmed {
             if stack.is_config_up() {
                 let since = *up_since.get_or_insert_with(embassy_time::Instant::now);

@@ -448,6 +448,11 @@ impl BleTable {
     }
 
     /// Devices ordered by signal strength, strongest first.
+    /// The devices in table order (no copy).
+    pub fn iter(&self) -> impl Iterator<Item = &BleDevice> {
+        self.devices.iter()
+    }
+
     pub fn sorted(&self) -> Vec<BleDevice, MAX_DEVICES> {
         let mut v = self.devices.clone();
         v.sort_unstable_by(|a, b| b.rssi.cmp(&a.rssi).then(a.addr.cmp(&b.addr)));
