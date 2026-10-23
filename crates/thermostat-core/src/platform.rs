@@ -79,7 +79,6 @@ impl BootState {
 }
 
 pub struct DeviceStatus {
-    pub boot: BootState,
     pub uptime_s: u64,
     /// Human-readable network state, e.g. "wifi 192.168.1.20" or "ap setup".
     pub network: String<48>,

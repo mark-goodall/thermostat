@@ -77,9 +77,8 @@ pub async fn handle<S: Read + Write, P: Platform>(
             respond(sock, page_buf, 200, "application/json", &[], |w| {
                     write!(
                         w,
-                        "{{\"version\":\"{}\",\"boot\":\"{}\",\"uptime_s\":{},\"provisioned\":{},\"network\":\"{}\",\"setpoint\":{}",
+                        "{{\"version\":\"{}\",\"uptime_s\":{},\"provisioned\":{},\"network\":\"{}\",\"setpoint\":{}",
                         p.running_version(),
-                        st.boot.as_str(),
                         st.uptime_s,
                         s.is_provisioned(),
                         st.network,
@@ -843,11 +842,10 @@ fn status_page(
 ) -> core::fmt::Result {
     write!(
         w,
-        "<table><tr><td>Firmware</td><td>{}</td></tr><tr><td>Boot state</td><td>{}</td></tr>\
+        "<table><tr><td>Firmware</td><td>{}</td></tr>\
 <tr><td>Uptime</td><td>{} s</td></tr><tr><td>Network</td><td>{}</td></tr>\
 <tr><td>Sensors</td><td>",
         Escape(version),
-        st.boot.as_str(),
         st.uptime_s,
         Escape(&st.network),
     )?;
@@ -1492,13 +1490,13 @@ const UPDATE_JS: &str = "b.onclick=()=>{const file=f.files[0];if(!file)return;co
 x.open('POST','/api/update');x.upload.onprogress=e=>{p.value=e.loaded/e.total};\
 x.onload=()=>{const r=JSON.parse(x.responseText);if(!r.ok){m.textContent='Failed: '+r.error;return}\
 m.textContent='Installed '+r.version+', rebooting…';const poll=()=>fetch('/api/status').then(r=>r.json())\
-.then(s=>{m.textContent='Running '+s.version+' ('+s.boot+')'}).catch(()=>setTimeout(poll,2000));setTimeout(poll,4000)};\
+.then(s=>{m.textContent='Running '+s.version}).catch(()=>setTimeout(poll,2000));setTimeout(poll,4000)};\
 x.onerror=()=>{m.textContent='Upload failed'};x.send(file)}";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::{BootState, DeviceStatus, Ota, OtaError, tests::FakeOta};
+    use crate::platform::{DeviceStatus, Ota, OtaError, tests::FakeOta};
     use crate::store::StoreError;
     use std::string::String as StdString;
     use std::vec::Vec;
@@ -1588,7 +1586,6 @@ mod tests {
         }
         fn status(&mut self) -> DeviceStatus {
             DeviceStatus {
-                boot: BootState::Booted,
                 uptime_s: 5,
                 network: String::try_from("qemu 10.0.2.15").unwrap(),
                 readings: self.readings.clone(),

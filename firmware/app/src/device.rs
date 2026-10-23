@@ -236,7 +236,6 @@ impl Platform for Handle {
             // Summary: the first heating zone (or the first zone) and the longest hold.
             let lead = zones.iter().find(|z| z.heating).unwrap_or(&zones[0]);
             DeviceStatus {
-                boot: d.boot,
                 uptime_s: Instant::now().as_secs(),
                 network: d.network.clone(),
                 readings: d.readings.clone(),

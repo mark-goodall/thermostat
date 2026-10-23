@@ -390,7 +390,7 @@ pub fn run(release: bool, zones_only: bool) -> Result<()> {
         let s = emu.wait_status("web server", Duration::from_secs(60), |s| {
             field(s, "version") == "e2e-1"
         })?;
-        anyhow::ensure!(field(&s, "boot") == "booted", "unexpected boot state {s}");
+        emu.wait_log(0, "boot state: booted", Duration::from_secs(5))?;
         anyhow::ensure!(
             s["provisioned"] == false,
             "fresh device should be unprovisioned"
@@ -470,12 +470,11 @@ pub fn run(release: bool, zones_only: bool) -> Result<()> {
             "upload: {code} {body}"
         );
         emu.wait_log(mark, "swapped (trial)", Duration::from_secs(120))?;
+        emu.wait_log(mark, "boot state: trial", Duration::from_secs(30))?;
         emu.wait_status("trial boot of e2e-2", Duration::from_secs(60), |s| {
-            field(s, "version") == "e2e-2" && field(s, "boot") == "trial"
+            field(s, "version") == "e2e-2"
         })?;
-        emu.wait_status("confirmation", Duration::from_secs(60), |s| {
-            field(s, "boot") == "booted"
-        })?;
+        emu.wait_log(mark, "image confirmed", Duration::from_secs(60))?;
         Ok(())
     })?;
 
@@ -535,18 +534,19 @@ pub fn run(release: bool, zones_only: bool) -> Result<()> {
         emu.wait_status("revert to e2e-2", Duration::from_secs(60), |s| {
             field(s, "version") == "e2e-2"
         })?;
-        emu.wait_status("re-confirmation", Duration::from_secs(60), |s| {
-            field(s, "boot") == "booted"
-        })?;
+        emu.wait_log(mark, "boot state: reverted", Duration::from_secs(30))?;
+        emu.wait_log(mark, "image confirmed", Duration::from_secs(60))?;
         Ok(())
     })?;
 
     step("serial update over the console UART", || {
+        let mark = emu.mark();
         let mut port = emu.port()?;
         ota::serial_update(&mut port, &std::fs::read(&v3.img)?, true)?;
-        emu.wait_status("e2e-3 confirmed", Duration::from_secs(180), |s| {
-            field(s, "version") == "e2e-3" && field(s, "boot") == "booted"
+        emu.wait_status("e2e-3 running", Duration::from_secs(180), |s| {
+            field(s, "version") == "e2e-3"
         })?;
+        emu.wait_log(mark, "image confirmed", Duration::from_secs(60))?;
         Ok(())
     })?;
 
